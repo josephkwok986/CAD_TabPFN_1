@@ -1,0 +1,10 @@
+version: 1
+app:
+  name: ${APP_NAME:my-service}
+  env: ${APP_ENV:dev}   # dev|test|staging|prod
+  tz_store: UTC         # 存储时区固定 UTC
+  tz_render: ${LOG_RENDER_TZ:Europe/London}  # 展示时区（IANA）
+
+logger:
+  level: ${LOG_LEVEL:INFO}   # DEBUG|INFO|WARN|ERROR
+  json: true
