@@ -1,0 +1,20 @@
+config:
+  version: 1
+
+runtime:
+  tz: ${ TZ:UTC }   # 若未设置环境变量 TZ，则取默认 UTC
+
+io:
+  root: "/tmp/app"
+  retry: 3
+
+limits:
+  rate: 100
+  concurrency: 8
+
+secrets:
+  db_password: env:DB_PASS  # 从环境变量 DB_PASS 解析
+
+db:
+  host: "127.0.0.1"
+  port: 5432
