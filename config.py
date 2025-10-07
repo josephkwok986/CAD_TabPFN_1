@@ -881,7 +881,7 @@ def test():
     
 if __name__ == "__main__":
     #test()
-    cfg = Config.load_singleton('test.yaml')
+    cfg = Config.load_singleton('main.yaml')
     exported = cfg.export("json")
     print("## EXPORT(JSON, redacted)")
     print(json.dumps(json.loads(exported), ensure_ascii=False, indent=2))

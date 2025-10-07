@@ -51,3 +51,23 @@ logger:
       - key
       - credential
       - pwd
+task_system:
+  pool:
+    default_ttl: 120.0
+    backend:
+      type: memory
+  executor:
+    max_concurrency: 4
+    lease_batch_size: 10
+    lease_ttl: 30.0
+    prefetch: 20
+    idle_sleep: 0.5
+    max_retries: 2
+    backoff_base: 0.5
+    backoff_jitter: 0.3
+    task_timeout: null
+    rate_limit_per_sec: null
+    rate_limit_burst: null
+    failure_delay: null
+    filters: {}
+    requeue_on_failure: true
