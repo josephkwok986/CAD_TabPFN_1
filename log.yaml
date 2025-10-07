@@ -1,10 +1,25 @@
 version: 1
 app:
   name: ${APP_NAME:my-service}
-  env: ${APP_ENV:dev}   # dev|test|staging|prod
-  tz_store: UTC         # 存储时区固定 UTC
-  tz_render: ${LOG_RENDER_TZ:Europe/London}  # 展示时区（IANA）
+  env: ${APP_ENV:dev}
+  tz_store: UTC
+  tz_render: ${LOG_RENDER_TZ:Europe/London}
 
 logger:
-  level: ${LOG_LEVEL:INFO}   # DEBUG|INFO|WARN|ERROR
-  json: true
+  level: ${LOG_LEVEL:INFO}
+  namespace: ${LOG_NAMESPACE:cad.tabpfn}
+  sinks:
+    - type: console
+      stream: stdout
+    - type: rotating_file
+      path: ${LOG_FILE_PATH:logs/app.log}
+      max_bytes: ${LOG_FILE_MAX_BYTES:10485760}
+      backups: ${LOG_FILE_BACKUPS:5}
+  sampling:
+    default_rate: ${LOG_SAMPLING_DEFAULT:1.0}
+    seed: ${LOG_SAMPLING_SEED:42}
+    rules:
+      - level: DEBUG
+        rate: ${LOG_SAMPLING_DEBUG_RATE:0.1}
+        burst: 5
+        interval: 60
