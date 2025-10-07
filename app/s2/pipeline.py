@@ -281,6 +281,7 @@ class S2Pipeline:
                 file=sys.stdout,
                 disable=False,
             )
+            progress.refresh()
 
         def update_progress(amount: int = 1) -> None:
             if progress is not None:
