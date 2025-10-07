@@ -71,3 +71,54 @@ task_system:
     failure_delay: null
     filters: {}
     requeue_on_failure: true
+
+pipelines:
+  s2:
+    sources:
+      - dataset: MFInstSeg
+        tier: gold
+        root: ${S2_MFINSTSEG_ROOT:./data/MFInstSeg}
+        pattern: "**/*"
+        allowed_extensions: [".step", ".stp", ".stpz", ".brep", ".brp"]
+      - dataset: MFCAD
+        tier: silver
+        root: ${S2_MFCAD_ROOT:./data/MFCAD}
+        pattern: "**/*"
+        allowed_extensions: [".step", ".stp", ".stpz", ".brep", ".brp"]
+    sampling:
+      subset_n: null
+      subset_frac: null
+      seed: 42
+    features:
+      descriptor_length: 64
+      sample_points: 4096
+      random_seed: 1337
+    dedup:
+      similarity_threshold: 0.995
+      bbox_tolerance: 0.02
+    clustering:
+      method: dbscan
+      eps: 0.012
+      min_samples: 6
+      auto_eps:
+        enabled: true
+        quantile: 0.12
+        sample_size: 20000
+        scale: 1.02
+    partition:
+      strategy: weighted
+      constraints:
+        max_items_per_task: 128
+        shuffle_seed: 42
+    outputs:
+      root: ${S2_OUTPUT_ROOT:./data/s2_out}
+      signatures_file: signatures.parquet
+      part_index_file: part_index.csv
+      part_index_for_split_file: part_index.for_split.csv
+      family_hist_file: family_hist.csv
+      diagnostics_file: diagnostics.json
+      write_signatures: true
+    quarantine:
+      preferred_tier: gold
+      reason: cross_tier_duplicate
+
