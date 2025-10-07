@@ -1,0 +1,245 @@
+{
+  "version": "1.0",
+  "project_root": "/workspace/Gjj Local/data/CAD/step_out",
+  "logging_config": {
+    "log_file": "/workspace/Gjj Local/data/CAD/step_out/s5_out/pipeline.log",
+    "level": "INFO",
+    "console_level": "WARNING"
+  },
+  "logging": {
+    "log_file": "/workspace/Gjj Local/data/CAD/step_out/s3_out/pipeline.log"
+  },
+
+  "s1_ingest": {
+    "raw_dir": "/workspace/Gjj Local/data/CAD/raw",
+    "out_dir": "/workspace/Gjj Local/data/CAD/step_out/s1_out"
+  },
+
+  "s2_dedup_family_occ": {
+    "raw_root": "/workspace/Gjj Local/data/CAD/CAD_data",
+    "out_root": "/workspace/Gjj Local/data/CAD/step_out/s2_out",
+    "_subset_n": 10000,
+    "_subset_frac": 0.01,
+    "subset_n": null,
+    "subset_frac": null,
+    "sample_points": 4096,
+    "d2_sim_threshold": 0.995,
+    "bbox_tol": 0.02,
+    "device": "gpu",
+    "demo_occ": false,
+    "log_level": "info",
+    "log_file": "/workspace/Gjj Local/data/CAD/step_out/s2_out/run.log",
+    "workers": 8,
+    "mp_start": "spawn",
+    "per_file_timeout_sec": 60,
+    "max_inflight_multiplier": 1,
+    "feature_norm": {
+      "block_l2": true,         
+      "global_l2": true,         
+      "block_weight": "equal"  
+    },
+    "_family_distance_threshold": 0.008,
+    "_family_min_samples": 5,
+    "_family_auto_eps": {
+      "enabled": true,
+      "quantile": 0.25,                          
+      "scale": 1.05,                              
+      "sample_n": 200000,                         
+      "knn_k": null,                            
+      "seed": 42
+    },
+    "family_distance_threshold": 0.012,
+    "family_min_samples": 6,
+    "family_auto_eps": {
+      "enabled": true,
+      "quantile": 0.12,      
+      "scale": 1.02,         
+      "sample_n": 200000,    
+      "knn_k": 6,           
+      "seed": 42
+    },
+    "family_noise_policy": "isolate",
+    "family_post_split": {
+      "enabled": true,
+      "max_fraction": 0.06,
+      "max_size": 6000,
+      "split_factor": 0.75,
+      "max_rounds": 6,
+      "min_eps": 1e-6,
+      "fallback": { "enabled": true, "method": "kmeans", "seed": 42 }
+    },
+    "diagnostics_topk": 10,
+    "diagnostics_write_hist": true,
+    "s2_fix_family": {
+      "in_part_index": "/workspace/Gjj Local/data/CAD/step_out/s2_out/part_index.csv",
+      "out_part_index": "/workspace/Gjj Local/data/CAD/step_out/s2_out/part_index.fix1.csv",
+      "out_family_hist": "/workspace/Gjj Local/data/CAD/step_out/s2_out/family_hist.fix1.csv",
+      "out_part_index_for_split": "/workspace/Gjj Local/data/CAD/step_out/s2_out/part_index.for_split.csv",
+      "log_level": "info",
+      "log_file": null
+    }
+  },
+
+  "s3_domain_and_timestamp": {
+    "_part_index": "/workspace/Gjj Local/data/CAD/step_out/s2_out/part_index.csv",
+    "part_index": "/workspace/Gjj Local/data/CAD/step_out/s2_out/part_index.for_split.csv",
+    "out": "/workspace/Gjj Local/data/CAD/step_out/s3_out/domains.csv",
+
+    "prefer_cudf": true,
+    "domain_keys": ["originating_system", "kernel", "source_dataset", "author"],
+    "timestamp_cols": ["timestamp", "created_at", "modified_at", "time", "date", "created_at_header"],
+    "path_col": "path",
+    "dataset_col": "source_dataset",
+    "unit_col": "unit",
+
+    "log_file": "/workspace/Gjj Local/data/CAD/step_out/s3_out/run.log",
+
+    "parallel_workers": 0,
+    "progress_min_percent": 1
+  },
+
+  "以下是lodo切分的配置": "",
+  "s4_make_splits": {
+    "input": "/workspace/Gjj Local/data/CAD/step_out/s3_out/domains.csv",
+    "outdir": "/workspace/Gjj Local/data/CAD/step_out/s4_out/",
+    "protocol": "lodo",
+    "part_col": "part_id",
+    "domain_col": "domain",
+    "timestamp_col": "timestamp",
+    "family_col": "family_id",
+    "duplicate_col": "duplicate_canonical",
+    "content_hash_col": "content_hash",
+    "calib_frac": 0.4,
+    "train_frac": 0.5,
+    "seed": 42,
+    "min_domain_size": 5,
+    "per_domain_temporal": false,
+    "part_index_dir": "/workspace/Gjj Local/data/CAD/step_out/s2_out/",
+    "num_workers": 8,
+    "iso_relax_frac": 0.10,
+    "iso_relax_to_calib_frac": 0.6
+  },
+
+  "以下是时间外切分（按全局时间，旧→新）的配置": "",
+  "_s4_make_splits": {
+    "input": "/workspace/Gjj Local/data/CAD/step_out/s3_out/domains.csv",
+    "outdir": "/workspace/Gjj Local/data/CAD/step_out/s4_out/",
+    "protocol": "temporal",
+    "part_col": "part_id",
+    "domain_col": "domain",
+    "timestamp_col": "timestamp",
+    "family_col": "family_id",
+    "duplicate_col": "duplicate_canonical", 
+    "content_hash_col": "content_hash",     
+    "calib_frac": 0.4,
+    "train_frac": 0.5,
+    "seed": 42,
+    "min_domain_size": 5,
+    "per_domain_temporal": false,
+    "part_index_dir": "/workspace/Gjj Local/data/CAD/step_out/s2_out/",
+    "num_workers": 4,
+    "iso_relax_frac": 0.10,
+    "iso_relax_to_calib_frac": 0.6
+  },
+  
+  "以下是时间外切分（各域分别做时间切分）的配置": "",
+  "2_s4_make_splits": {
+    "input": "/workspace/Gjj Local/data/CAD/step_out/s3_out/domains.csv",
+    "outdir": "/workspace/Gjj Local/data/CAD/step_out/s4_out/",
+    "protocol": "temporal",
+    "part_col": "part_id",
+    "domain_col": "domain",
+    "timestamp_col": "timestamp",
+    "family_col": "family_id",
+    "calib_frac": 0.10,
+    "train_frac": 0.75,
+    "seed": 42,
+    "min_domain_size": 5,
+    "per_domain_temporal": true,
+    "stratify_col": "",
+    "part_index_dir": "/workspace/Gjj Local/data/CAD/step_out/s2_out/",
+    "num_workers": 4
+  },
+  "s5": {
+    "input": {
+      "split_root": "/workspace/Gjj Local/data/CAD/step_out/s4_out",
+      "part_index_csv": "/workspace/Gjj Local/data/CAD/step_out/s2_out/part_index.for_split.csv",
+      "path_column": "rel_path",
+      "part_id_column": "part_id",
+      "source_dataset_column": "source_dataset",
+      "rel_root_map": {
+        "MFInstSeg": "/workspace/Gjj Local/data/CAD/CAD_data",
+        "MFCAD": "/workspace/Gjj Local/data/CAD/CAD_data",
+        "MFCAD2": "/workspace/Gjj Local/data/CAD/CAD_data"
+      }
+    },
+    "geometry": {
+      "mesh_deflection": 0.1,
+      "mesh_angle": 0.5,
+      "cylinder_min_radius_mm": 0.25,
+      "hole_min_length_mm": 0.5,
+      "coaxial_dot_min": 0.995,
+      "allow_missing_entry_ring": true,
+      "max_candidates_per_part": 128
+    },
+    "recall_guard": {
+      "target_recall": 0.98,
+      "stress_synth_seed": 20250926,
+      "enable_synth": true
+    },
+    "resources": {
+      "device": "gpu",                
+      "gpu_min_items": 1,             
+      "num_workers": 12,
+      "max_inflight_multiplier": 2,
+      "per_file_timeout_sec": 50,
+      "hard_timeout_sec": 60,
+      "watchdog_poll_sec": 5
+    },
+    "logging": {
+      "level": "INFO",
+      "log_every_n_parts": 200,
+      "max_log_parts": 5,
+      "silence_workers": true
+    },
+    "output": {
+      "filename_policy": "flatten",
+      "flatten_sep": "__",
+      "dir": "/workspace/Gjj Local/data/CAD/step_out/s5_out"
+    }
+  },
+
+  "s6": {
+    "out_root": "/workspace/Gjj Local/data/CAD/step_out/s6_out",
+    "target_recall": null,
+    "stress_total": 600,
+    "stress_seed": null,
+    "s4_root": "/workspace/Gjj Local/data/CAD/step_out/s4_out",
+    "apply_protocols": [],
+    "max_candidates_per_part_factor": 1.35,
+    "max_latency_factor": 1.25,
+    "stages": ["A","B","C"],
+    "grid_size": 3,
+    "require_center_on_stress": false,
+    "match": {
+      "axis_tol_deg": 5.0,
+      "axis_tol_deg_hi": 8.0,
+      "entrance_center_tol_frac": 0.3,
+      "entrance_center_tol_mm": 0.2,
+      "iou_axis_min": 0.7
+    },
+    "resources": {
+      "num_workers": 12,
+      "max_inflight_multiplier": 3,
+      "per_file_timeout_sec": 50,
+      "hard_timeout_sec": 60,
+      "watchdog_poll_sec": 5
+    },
+    "real_slice_check": {
+      "sample_n": 300,
+      "sample_seed": 123,
+      "subsets": ["train","calib"]
+    },
+    "log_file": "/workspace/Gjj Local/data/CAD/step_out/s6_out/pipeline.log"
+  }
+}
