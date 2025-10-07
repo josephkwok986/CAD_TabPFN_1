@@ -29,6 +29,8 @@ from task_system_config import ensure_task_config
 
 from .settings import S2PipelineConfig, SourceSettings
 
+from tqdm import tqdm
+
 try:  # Optional dependency for clustering
     from sklearn.cluster import DBSCAN  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
@@ -265,6 +267,21 @@ class S2Pipeline:
             task.task_id: tuple(int(i) for i in task.extras.get("item_indexes", []))
             for task in plan.tasks
         }
+        total_items = sum(len(indexes) for indexes in indices_cache.values())
+        progress = None
+        if total_items > 0:
+            miniters = max(1, math.ceil(total_items / 100))
+            progress = tqdm(
+                total=total_items,
+                desc="S2 pipeline",
+                unit="part",
+                miniters=miniters,
+                leave=False,
+            )
+
+        def update_progress(amount: int = 1) -> None:
+            if progress is not None:
+                progress.update(amount)
 
         def handler(leased) -> None:
             indexes = indices_cache.get(leased.task.task_id, tuple())
@@ -287,8 +304,13 @@ class S2Pipeline:
                         total=total,
                         part_id=record.part_id,
                     )
+                update_progress()
 
-        ParallelExecutor.run(handler, pool, policy)
+        try:
+            ParallelExecutor.run(handler, pool, policy)
+        finally:
+            if progress is not None:
+                progress.close()
 
     # ------------------------------------------------------------------
     # Feature extraction
