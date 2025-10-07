@@ -2,4 +2,3 @@ docker build -t tabpfn_cad -f Dockerfile.tabfpn_cad1.0 .
 docker run -it -v "/mnt/c/Users/GJJ/":/workspace -v "/mnt/c/Users/GJJ/Gjj Doc/Code/git/.ssh:/root/.ssh:ro" -p 8888:8888 -p 1455:1455 --rm --gpus all tabpfn_cad /bin/bash -c "cd /workspace/'Gjj Doc'/Code && /bin/bash /start_jupyter.sh && exec /bin/bash"
 
 python -m app.s2.pipeline --config main.yaml
-
