@@ -3,3 +3,4 @@ docker run -it -v "/mnt/c/Users/GJJ/":/workspace -v "/mnt/c/Users/GJJ/Gjj Doc/Co
 
 python -m app.s2.pipeline --config main.yaml
 
+docker run -it -v "/mnt/c/Users/GJJ/":/workspace -v "/mnt/c/Users/GJJ/Gjj Doc/Code/certification/git/.ssh:/root/.ssh:ro" -v "/mnt/c/Users/GJJ/Gjj Doc/Code/certification/.codex:/root/.codex:rw" -p 8888:8888 -p 1455:1455 --rm --gpus all tabpfn_cad /bin/bash -c "cd /workspace/'Gjj Doc'/Code && /bin/bash /start_jupyter.sh && exec /bin/bash"
