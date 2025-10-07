@@ -276,7 +276,10 @@ class S2Pipeline:
                 desc="S2 pipeline",
                 unit="part",
                 miniters=miniters,
-                leave=False,
+                leave=True,
+                dynamic_ncols=True,
+                file=sys.stdout,
+                disable=False,
             )
 
         def update_progress(amount: int = 1) -> None:
@@ -310,6 +313,7 @@ class S2Pipeline:
             ParallelExecutor.run(handler, pool, policy)
         finally:
             if progress is not None:
+                progress.refresh()
                 progress.close()
 
     # ------------------------------------------------------------------
