@@ -17,8 +17,8 @@ interface:
     >>> logger = StructuredLogger.get_logger("cad.example")
     >>> logger.info("service.start", msg="Service has started")
 
-Configuration can be bootstrapped from ``g_Config`` (see
-``config_service.Config``) or provided programmatically.
+Configuration can be bootstrapped from the :class:`config_service.Config`
+singleton or provided programmatically.
 
 Basic tests are provided at the bottom of the file and can be executed with::
 
@@ -73,10 +73,10 @@ except Exception:
     tz = _FallbackTZ()  # type: ignore
 
 try:
-    from config_service import g_Config  # type: ignore
+    from config_service import Config  # type: ignore
     _CONFIG_IMPORT_ERROR: Optional[Exception] = None
 except Exception as exc:  # pragma: no cover
-    g_Config = None  # type: ignore
+    Config = None  # type: ignore
     _CONFIG_IMPORT_ERROR = exc
 
 
@@ -477,9 +477,14 @@ class StructuredLogger:
 
     @classmethod
     def configure_from_config(cls, config: Optional[Any] = None) -> None:
-        cfg = config or g_Config
+        cfg = config
         if cfg is None:
-            raise RuntimeError("g_Config is unavailable") from _CONFIG_IMPORT_ERROR
+            if Config is None:
+                raise RuntimeError("Config service is unavailable") from _CONFIG_IMPORT_ERROR
+            try:
+                cfg = Config.get_singleton()
+            except RuntimeError as exc:
+                raise RuntimeError("Config singleton is unavailable") from exc
         sinks = cfg.get("logger.sinks", list, [])
         level = cfg.get("logger.level", str, "INFO")
         sampling = cfg.get("logger.sampling", dict, {})
@@ -627,9 +632,12 @@ def _import_string(path: str) -> Callable[..., Any]:
     return getattr(module, attr)
 
 
-# Auto-configure from global configuration on import.
-if g_Config is not None:
-    StructuredLogger.configure_from_config()
+# Auto-configure from global configuration on import if available.
+if Config is not None:
+    try:
+        StructuredLogger.configure_from_config(Config.get_singleton())
+    except RuntimeError:
+        StructuredLogger.configure(sinks=[{"type": "console", "stream": "stdout"}], level="INFO", sampling={"default_rate": 1.0, "seed": 42}, redaction={}, timezone="UTC", namespace="cad.logger")
 else:
     StructuredLogger.configure(sinks=[{"type": "console", "stream": "stdout"}], level="INFO", sampling={"default_rate": 1.0, "seed": 42}, redaction={}, timezone="UTC", namespace="cad.logger")
 
