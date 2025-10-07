@@ -77,12 +77,17 @@ pipelines:
     sources:
       - dataset: MFInstSeg
         tier: gold
-        root: ${S2_MFINSTSEG_ROOT:./data/MFInstSeg}
+        root: /workspace/Gjj Local/data/CAD/CAD_data/MFInstSeg}
         pattern: "**/*"
         allowed_extensions: [".step", ".stp", ".stpz", ".brep", ".brp"]
       - dataset: MFCAD
         tier: silver
-        root: ${S2_MFCAD_ROOT:./data/MFCAD}
+        root: /workspace/Gjj Local/data/CAD/CAD_data/MFCAD}
+        pattern: "**/*"
+        allowed_extensions: [".step", ".stp", ".stpz", ".brep", ".brp"]
+      - dataset: MFCAD2
+        tier: silver
+        root: /workspace/Gjj Local/data/CAD/CAD_data/MFCAD2}
         pattern: "**/*"
         allowed_extensions: [".step", ".stp", ".stpz", ".brep", ".brp"]
     sampling:
@@ -111,7 +116,7 @@ pipelines:
         max_items_per_task: 128
         shuffle_seed: 42
     outputs:
-      root: ${S2_OUTPUT_ROOT:./data/s2_out}
+      root: /workspace/Gjj Local/data/CAD/step_out/s2_out}
       signatures_file: signatures.parquet
       part_index_file: part_index.csv
       part_index_for_split_file: part_index.for_split.csv
