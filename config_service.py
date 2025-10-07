@@ -334,6 +334,9 @@ class Config:
     Main configuration service.
     """
 
+    _singleton: Optional["Config"] = None
+    _singleton_lock = threading.Lock()
+
     def __init__(self):
         self._data: dict = {}
         self._schema: Any = None
@@ -352,7 +355,7 @@ class Config:
     # ---------- Interface ----------
 
     @classmethod
-    def load(
+    def _load_instance(
         cls,
         path_or_stream: Union[str, Path, io.TextIOBase],
         schema: Optional[Union[dict, "BaseModel"]] = None,
@@ -449,6 +452,71 @@ class Config:
             _install_sighup_handler(self)
 
         return self
+
+    @classmethod
+    def load(
+        cls,
+        path_or_stream: Union[str, Path, io.TextIOBase],
+        schema: Optional[Union[dict, "BaseModel"]] = None,
+        defaults: Optional[dict] = None,
+        env_prefix: Optional[str] = None,
+        cli_overrides: Optional[Dict[str, Any]] = None,
+        strict: bool = True,
+        enable_sighup: bool = False,
+        secret_resolvers: Optional[Dict[str, Callable[[str], str]]] = None,
+        migrate_to: Optional[int] = None,
+    ) -> "Config":
+        return cls._load_instance(
+            path_or_stream,
+            schema=schema,
+            defaults=defaults,
+            env_prefix=env_prefix,
+            cli_overrides=cli_overrides,
+            strict=strict,
+            enable_sighup=enable_sighup,
+            secret_resolvers=secret_resolvers,
+            migrate_to=migrate_to,
+        )
+
+    @classmethod
+    def load_singleton(
+        cls,
+        path_or_stream: Union[str, Path, io.TextIOBase],
+        schema: Optional[Union[dict, "BaseModel"]] = None,
+        defaults: Optional[dict] = None,
+        env_prefix: Optional[str] = None,
+        cli_overrides: Optional[Dict[str, Any]] = None,
+        strict: bool = True,
+        enable_sighup: bool = False,
+        secret_resolvers: Optional[Dict[str, Callable[[str], str]]] = None,
+        migrate_to: Optional[int] = None,
+    ) -> "Config":
+        instance = cls._load_instance(
+            path_or_stream,
+            schema=schema,
+            defaults=defaults,
+            env_prefix=env_prefix,
+            cli_overrides=cli_overrides,
+            strict=strict,
+            enable_sighup=enable_sighup,
+            secret_resolvers=secret_resolvers,
+            migrate_to=migrate_to,
+        )
+        with cls._singleton_lock:
+            cls._singleton = instance
+        return instance
+
+    @classmethod
+    def set_singleton(cls, instance: Optional["Config"]) -> None:
+        with cls._singleton_lock:
+            cls._singleton = instance
+
+    @classmethod
+    def get_singleton(cls) -> "Config":
+        with cls._singleton_lock:
+            if cls._singleton is None:
+                raise RuntimeError("Config singleton has not been initialised")
+            return cls._singleton
 
     def get(self, key: str, type: type, default: Any = None) -> Any:
         """
@@ -650,6 +718,9 @@ def test():
             os.environ["APP__io__rate_limit"] = "42"
             os.environ["APP__list__values"] = "[1,2,3]"
 
+        def tearDown(self) -> None:
+            Config.set_singleton(None)
+
         def _write(self, text: str, dir: Path, name: str) -> Path:
             p = dir / name
             p.write_text(dedent(text).lstrip(), encoding="utf-8")
@@ -788,14 +859,29 @@ def test():
                 fp2 = cfg.last_load_info.fingerprint if cfg.last_load_info else ""
                 self.assertNotEqual(fp1, fp2)
 
+        def test_singleton_helpers(self):
+            with tempfile.TemporaryDirectory() as td:
+                d = Path(td)
+                main = self._write("""
+                config: {version: 1}
+                value: 123
+                """, d, "conf.yml")
+
+                Config.set_singleton(None)
+                cfg = Config.load_singleton(main)
+                self.assertIs(cfg, Config.get_singleton())
+                self.assertEqual(Config.get_singleton().get("value", int), 123)
+
+                Config.set_singleton(None)
+                with self.assertRaises(RuntimeError):
+                    Config.get_singleton()
+
     unittest.main()
 
     
-g_Config = Config.load('test.yaml')
-
 if __name__ == "__main__":
     #test()
-    cfg = Config.load('test.yaml')
+    cfg = Config.load_singleton('test.yaml')
     exported = cfg.export("json")
     print("## EXPORT(JSON, redacted)")
     print(json.dumps(json.loads(exported), ensure_ascii=False, indent=2))
