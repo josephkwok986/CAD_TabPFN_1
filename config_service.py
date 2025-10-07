@@ -790,6 +790,9 @@ def test():
 
     unittest.main()
 
+    
+g_Config = Config.load('test.yaml')
+
 if __name__ == "__main__":
     #test()
     cfg = Config.load('test.yaml')

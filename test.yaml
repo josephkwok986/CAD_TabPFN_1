@@ -1,20 +1,25 @@
-config:
-  version: 1
+version: 1
+app:
+  name: ${APP_NAME:my-service}
+  env: ${APP_ENV:dev}
+  tz_store: UTC
+  tz_render: ${LOG_RENDER_TZ:Europe/London}
 
-runtime:
-  tz: ${ TZ:UTC }   # 若未设置环境变量 TZ，则取默认 UTC
-
-io:
-  root: "/tmp/app"
-  retry: 3
-
-limits:
-  rate: 100
-  concurrency: 8
-
-secrets:
-  db_password: env:DB_PASS  # 从环境变量 DB_PASS 解析
-
-db:
-  host: "127.0.0.1"
-  port: 5432
+logger:
+  level: ${LOG_LEVEL:INFO}
+  namespace: ${LOG_NAMESPACE:cad.tabpfn}
+  sinks:
+    - type: console
+      stream: stdout
+    - type: rotating_file
+      path: ${LOG_FILE_PATH:logs/app.log}
+      max_bytes: ${LOG_FILE_MAX_BYTES:10485760}
+      backups: ${LOG_FILE_BACKUPS:5}
+  sampling:
+    default_rate: ${LOG_SAMPLING_DEFAULT:1.0}
+    seed: ${LOG_SAMPLING_SEED:42}
+    rules:
+      - level: DEBUG
+        rate: ${LOG_SAMPLING_DEBUG_RATE:0.1}
+        burst: 5
+        interval: 60
