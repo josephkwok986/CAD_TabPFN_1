@@ -1,13 +1,29 @@
 version: 1
+config:
+  version: 1
 app:
   name: ${APP_NAME:my-service}
   env: ${APP_ENV:dev}
   tz_store: UTC
   tz_render: ${LOG_RENDER_TZ:Europe/London}
-
+runtime:
+  tz: UTC
+io:
+  root: /var/run/app
+  retry: 3
+limits:
+  rate: 100
+  concurrency: 16
+db:
+  host: 127.0.0.1
+  port: 5432
+secrets:
+  db_password: env:DB_PASS
 logger:
   level: ${LOG_LEVEL:INFO}
   namespace: ${LOG_NAMESPACE:cad.tabpfn}
+  timezone:
+    render: ${LOG_RENDER_TZ:Europe/London}
   sinks:
     - type: console
       stream: stdout
@@ -23,3 +39,15 @@ logger:
         rate: ${LOG_SAMPLING_DEBUG_RATE:0.1}
         burst: 5
         interval: 60
+  redact:
+    allow:
+      - trace_id
+      - span_id
+      - corr_id
+    deny_patterns:
+      - password
+      - secret
+      - token
+      - key
+      - credential
+      - pwd
