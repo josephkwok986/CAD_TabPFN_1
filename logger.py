@@ -17,12 +17,12 @@ interface:
     >>> logger = StructuredLogger.get_logger("cad.example")
     >>> logger.info("service.start", msg="Service has started")
 
-Configuration can be bootstrapped from the :class:`config_service.Config`
+Configuration can be bootstrapped from the :class:`config.Config`
 singleton or provided programmatically.
 
 Basic tests are provided at the bottom of the file and can be executed with::
 
-    python structured_logging.py
+    python logger.py
 """
 from __future__ import annotations
 
@@ -73,7 +73,7 @@ except Exception:
     tz = _FallbackTZ()  # type: ignore
 
 try:
-    from config_service import Config  # type: ignore
+    from config import Config  # type: ignore
     _CONFIG_IMPORT_ERROR: Optional[Exception] = None
 except Exception as exc:  # pragma: no cover
     Config = None  # type: ignore
