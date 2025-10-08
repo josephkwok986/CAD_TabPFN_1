@@ -139,6 +139,35 @@ task_system:
     requeue_on_failure: true
     # 首选的 GPU 索引列表，决定 worker 绑定的显卡
     preferred_gpus: [0]
+    # 心跳间隔（秒），null 表示按 lease_ttl 自动计算
+    heartbeat_interval: null
+    # 派发调度控制参数
+    dispatch:
+      # 波次窗口系数，窗口 ≈ 并发上限 × 该系数
+      window_multiplier: 2.0
+      token:
+        # 初始令牌补给速率（任务/秒）
+        initial_rate: 64.0
+        # 令牌桶容量（最大积累令牌数）
+        capacity: 256
+        # 最小补给速率
+        min_rate: 1.0
+        # 最大补给速率，null 表示不限
+        max_rate: null
+      target_utilisation:
+        # 资源利用率低于该阈值时提升并发
+        low: 0.75
+        # 资源利用率高于该阈值时降低并发
+        high: 0.85
+      # 调度指标评估周期（秒）
+      evaluation_interval: 5.0
+      # 指标 EMA 平滑系数
+      ema_alpha: 0.2
+      aimd:
+        # AIMD 加性增长步长
+        step: 1
+        # AIMD 乘性衰减系数
+        decay: 0.5
 
 # 业务管线配置集合
 pipelines:
@@ -208,6 +237,8 @@ pipelines:
       eps: 0.012
       # 聚类形成所需的最小点数
       min_samples: 6
+      # 构建 FAISS kNN 图时使用的 k
+      knn_k: 96
       # 自动估计 eps 的相关设置
       auto_eps:
         # 是否启用自动估计

@@ -15,9 +15,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
-from logger import StructuredLogger
-from task_partitioner import TaskRecord
-from task_system_config import get_pool_value
+from .logger import StructuredLogger
+from .task_partitioner import TaskRecord
+from .task_system_config import get_pool_value
 
 
 logger = StructuredLogger.get_logger("cad.task_pool")
@@ -176,10 +176,11 @@ class InMemoryBackend(TaskPoolBackend):
                 if not self._match_filters(entry, filters):
                     skipped.append((priority, seq, entry))
                     continue
+                ttl = max(0.1, float(lease_ttl))
                 entry.lease_id = uuid.uuid4().hex
-                entry.lease_deadline = now + lease_ttl
+                entry.lease_deadline = now + ttl
                 entry.attempt += 1
-                entry.metadata.setdefault("last_lease_ttl", lease_ttl)
+                entry.metadata.setdefault("last_lease_ttl", ttl)
                 self._leased[entry.task.task_id] = entry
                 leased.append(entry)
             for item in skipped:
@@ -479,7 +480,7 @@ class TaskPool:
                     task=task,
                     priority=priority if priority is not None else task.priority or 0,
                     visible_at=now,
-                    expires_at=(now + ttl) if ttl is not None else None,
+                    expires_at=None,
                     lease_deadline=None,
                     lease_id=None,
                     attempt=0,

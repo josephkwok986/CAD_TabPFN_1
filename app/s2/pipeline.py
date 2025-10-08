@@ -15,18 +15,21 @@ import time
 import dataclasses
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from contextlib import contextmanager
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
 
 try:
     import pandas as pd  # type: ignore
 except ModuleNotFoundError:
     pd = None  # type: ignore
 
-from config import Config
-from logger import StructuredLogger
-from parallel_executor import ExecutorEvents, ExecutorPolicy, ParallelExecutor, TaskResult
-from task_partitioner import (
+from base_components.config import Config
+from base_components.logger import StructuredLogger
+from base_components.parallel_executor import ExecutorEvents, ExecutorPolicy, ParallelExecutor, TaskResult
+from base_components.streaming_utils import CSVRecordReader, CSVRecordWriter, StreamFingerprint
+from base_components.task_partitioner import (
     ItemRecord,
     Plan,
     PlanStatistics,
@@ -35,8 +38,8 @@ from task_partitioner import (
     TaskPartitioner,
     TaskRecord,
 )
-from task_pool import LeasedTask, TaskPool
-from task_system_config import ensure_task_config
+from base_components.task_pool import LeasedTask, TaskPool
+from base_components.task_system_config import ensure_task_config
 
 from .settings import S2PipelineConfig, SourceSettings
 
@@ -51,6 +54,13 @@ try:  # Optional GPU acceleration
     import torch  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
     torch = None  # type: ignore
+
+
+import numpy as np  # type: ignore
+try:  # Optional FAISS for fast kNN
+    import faiss  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    faiss = None  # type: ignore
 
 
 @dataclass(frozen=True)
@@ -440,9 +450,8 @@ class StageCacheManager:
             return None
         if meta.get("input_fingerprint") != expected_input:
             return None
-        with path.open("r", encoding="utf-8", newline="") as fh:
-            reader = csv.DictReader(fh)
-            rows = []
+        rows = []
+        with CSVRecordReader(path) as reader:
             for row in reader:
                 parsed = dict(row)
                 for key in ("descriptor_vector", "bbox_ratios"):
@@ -468,34 +477,98 @@ class StageCacheManager:
             "descriptor_norm",
             "bbox_ratios",
         ]
-        with self._paths.execution_cache.open("w", encoding="utf-8", newline="") as fh:
-            writer = csv.DictWriter(fh, fieldnames=fieldnames)
-            writer.writeheader()
-            for record in records:
-                data = _record_to_dict(record)
-                writer.writerow(
-                    {
-                        "part_id": data["part_id"],
-                        "dataset": data["dataset"],
-                        "dataset_tier": data["dataset_tier"],
-                        "rel_path": data["rel_path"],
-                        "abs_path": data["abs_path"],
-                        "file_size": data["file_size"],
-                        "modified_utc": data["modified_utc"],
-                        "content_hash": data["content_hash"],
-                        "geom_hash": data["geom_hash"],
-                        "descriptor_vector": json.dumps(data["descriptor_vector"], ensure_ascii=False),
-                        "descriptor_norm": f"{float(data['descriptor_norm']):.12f}",
-                        "bbox_ratios": json.dumps(data["bbox_ratios"], ensure_ascii=False),
-                    }
-                )
+        fingerprint_builder = StreamFingerprint()
+        writer = CSVRecordWriter(
+            self._paths.execution_cache,
+            fieldnames,
+            transform=self._execution_record_row,
+            fingerprint=fingerprint_builder,
+            fingerprint_fields=("part_id", "content_hash", "geom_hash"),
+        )
+        try:
+            writer.write_batch(records)
+        finally:
+            writer.close()
+        self._save_execution_meta(
+            fingerprint=fingerprint or fingerprint_builder.hexdigest(),
+            input_fp=input_fp,
+            count=writer.count(),
+        )
+
+    def _save_execution_meta(self, *, fingerprint: str, input_fp: str, count: int) -> None:
         meta = {
             "fingerprint": fingerprint,
             "input_fingerprint": input_fp,
-            "count": len(records),
+            "count": count,
             "saved_at": datetime.now(timezone.utc).isoformat(),
         }
         self._save_meta(self._paths.execution_meta, meta)
+
+    def execution_cache_meta(self) -> Dict[str, Any]:
+        return self._load_meta(self._paths.execution_meta)
+
+    def save_execution_meta(self, fingerprint: str, input_fp: str, count: int) -> None:
+        self._save_execution_meta(fingerprint=fingerprint, input_fp=input_fp, count=count)
+
+    def execution_writer(self) -> Tuple[CSVRecordWriter, StreamFingerprint]:
+        fieldnames = [
+            "part_id",
+            "dataset",
+            "dataset_tier",
+            "rel_path",
+            "abs_path",
+            "file_size",
+            "modified_utc",
+            "content_hash",
+            "geom_hash",
+            "descriptor_vector",
+            "descriptor_norm",
+            "bbox_ratios",
+        ]
+        self._ensure_root()
+        fingerprint = StreamFingerprint()
+        writer = CSVRecordWriter(
+            self._paths.execution_cache,
+            fieldnames,
+            transform=self._execution_record_row,
+            fingerprint=fingerprint,
+            fingerprint_fields=("part_id", "content_hash", "geom_hash"),
+        )
+        return writer, fingerprint
+
+    def iter_execution_records(self) -> Iterator[PartFeatureRecord]:
+        path = self._paths.execution_cache
+        if not path.exists():
+            return iter(())
+
+        def _generator() -> Iterator[PartFeatureRecord]:
+            with CSVRecordReader(path) as reader:
+                for row in reader:
+                    parsed = dict(row)
+                    for key in ("descriptor_vector", "bbox_ratios"):
+                        if parsed.get(key):
+                            parsed[key] = json.loads(parsed[key])
+                    yield _record_from_dict(parsed)
+
+        return _generator()
+
+    @staticmethod
+    def _execution_record_row(record: PartFeatureRecord) -> Dict[str, object]:
+        data = _record_to_dict(record)
+        return {
+            "part_id": data["part_id"],
+            "dataset": data["dataset"],
+            "dataset_tier": data["dataset_tier"],
+            "rel_path": data["rel_path"],
+            "abs_path": data["abs_path"],
+            "file_size": data["file_size"],
+            "modified_utc": data["modified_utc"],
+            "content_hash": data["content_hash"],
+            "geom_hash": data["geom_hash"],
+            "descriptor_vector": json.dumps(data["descriptor_vector"], ensure_ascii=False),
+            "descriptor_norm": f"{float(data['descriptor_norm']):.12f}",
+            "bbox_ratios": json.dumps(data["bbox_ratios"], ensure_ascii=False),
+        }
 
     def load_dataframe(self, expected_input: str) -> Optional[Tuple["pd.DataFrame", Optional[str]]]:
         path = self._paths.dataframe_cache
@@ -538,9 +611,22 @@ class StageCacheManager:
         self._ensure_root()
         if pd is None:
             raise RuntimeError("pandas is required to save cached enrichment dataframe")
-        df.to_csv(self._paths.enrichment_cache, index=False)
+        columns = [str(col) for col in df.columns]
+        fingerprint_builder = StreamFingerprint()
+        writer = CSVRecordWriter(
+            self._paths.enrichment_cache,
+            columns,
+            fingerprint=fingerprint_builder,
+            fingerprint_fields=("part_id", "duplicate_canonical", "family_id", "cross_tier_quarantine"),
+        )
+        try:
+            for row in df.itertuples(index=False, name=None):
+                writer.write({col: value for col, value in zip(columns, row)})
+        finally:
+            writer.close()
+        calculated_fp = fingerprint or fingerprint_builder.hexdigest()
         meta = {
-            "fingerprint": fingerprint,
+            "fingerprint": calculated_fp,
             "input_fingerprint": input_fp,
             "count": len(df),
             "saved_at": datetime.now(timezone.utc).isoformat(),
@@ -639,6 +725,7 @@ class PipelineProgressTracker:
         self._position = 1  # position 0 is reserved for the overall bar
         self._overall: Optional[tqdm] = None
         self._stages: set[str] = set()
+        self._stage_groups: Dict[str, List[tqdm]] = defaultdict(list)
 
     def ensure_overall(self, *, desc: str, unit: str) -> Optional[tqdm]:
         if self._overall is not None:
@@ -664,6 +751,7 @@ class PipelineProgressTracker:
         return self._overall
 
     def create_bar(self, stage: str, **kwargs) -> Optional[tqdm]:
+        pipeline_stage = kwargs.pop("pipeline_stage", None)
         with self._lock:
             position = self._position
             self._position += 1
@@ -676,7 +764,27 @@ class PipelineProgressTracker:
         with self._lock:
             self._bars.append(bar)
             self._stages.add(stage)
+            if isinstance(pipeline_stage, str) and pipeline_stage:
+                self._stage_groups[pipeline_stage].append(bar)
         return bar
+
+    def complete_stage(self, pipeline_stage: Optional[str]) -> None:
+        if not pipeline_stage:
+            return
+        with self._lock:
+            bars = list(self._stage_groups.get(pipeline_stage, ()))
+        for bar in bars:
+            total = bar.total
+            if total is None or total < bar.n:
+                total = bar.n or 0
+            if total <= 0:
+                total = 1
+            if bar.total is None or bar.total < total:
+                bar.total = total
+            remaining = bar.total - bar.n if bar.total is not None else 0
+            if remaining > 0:
+                bar.update(remaining)
+            bar.refresh()
 
     def add_overall_total(self, amount: int) -> None:
         bar = self._overall
@@ -703,6 +811,7 @@ class PipelineProgressTracker:
             self._stages.clear()
             self._overall = None
             self._position = 1
+            self._stage_groups.clear()
         for bar in bars:
             bar.refresh()
             bar.close()
@@ -724,9 +833,11 @@ class S2Pipeline:
         self.config = config
         self.logger = logger or StructuredLogger.get_logger("cad.s2.pipeline")
         self.paths = S2Paths.from_config(config)
-        self._results: Dict[str, PartFeatureRecord] = {}
         self._results_lock = threading.RLock()
+        self._execution_seen: Set[str] = set()
+        self._execution_writer: Optional[CSVRecordWriter] = None
         self._progress: Optional[PipelineProgressTracker] = None
+        self._current_stage: Optional[str] = None
         self._cache = StageCacheManager(self.paths)
 
     # ------------------------------------------------------------------
@@ -738,26 +849,30 @@ class S2Pipeline:
         progress = PipelineProgressTracker()
         self._progress = progress
         progress.ensure_overall(desc="S2 pipeline (overall)", unit="work")
-        with self.logger.stage("Discovery"):
-            self.logger.info(
-                "s2.pipeline.start",
-                sources=len(self.config.sources),
-                output_root=str(self.paths.root),
-            )
-            self.logger.info(
-                "s2.sampling.config",
-                probability=float(self.config.sampling.probability),
-                subset_n=(int(self.config.sampling.subset_n) if self.config.sampling.subset_n is not None else None),
-                subset_frac=(float(self.config.sampling.subset_frac) if self.config.sampling.subset_frac is not None else None),
-                seed=int(self.config.sampling.seed),
-            )
-            self.logger.info("s2.progress.layout", bars=list(progress.stages()))
+        self.logger.info(
+            "s2.pipeline.bootstrap",
+            sources=len(self.config.sources),
+            output_root=str(self.paths.root),
+            stage="Bootstrap",
+        )
         try:
             ensure_task_config()
             self.paths.root.mkdir(parents=True, exist_ok=True)
             cache_cfg = self.config.stage_cache
-
-            with self.logger.stage("Discovery"):
+            with self._stage("Discovery"):
+                self.logger.info(
+                    "s2.pipeline.start",
+                    sources=len(self.config.sources),
+                    output_root=str(self.paths.root),
+                )
+                self.logger.info(
+                    "s2.sampling.config",
+                    probability=float(self.config.sampling.probability),
+                    subset_n=(int(self.config.sampling.subset_n) if self.config.sampling.subset_n is not None else None),
+                    subset_frac=(float(self.config.sampling.subset_frac) if self.config.sampling.subset_frac is not None else None),
+                    seed=int(self.config.sampling.seed),
+                )
+                self.logger.info("s2.progress.layout", bars=list(progress.stages()))
                 # Discovery -------------------------------------------------
                 candidates: List[PartCandidate]
                 candidate_fp: str
@@ -777,6 +892,7 @@ class S2Pipeline:
                                 total=len(candidates),
                                 desc="Discovery (cache)",
                                 unit="path",
+                                pipeline_stage=self._current_stage,
                             )
                             if bar is not None:
                                 bar.update(len(candidates))
@@ -793,7 +909,7 @@ class S2Pipeline:
                     self._write_empty_outputs()
                     return
 
-            with self.logger.stage("Planning"):
+            with self._stage("Planning"):
                 # Planning --------------------------------------------------
                 plan: Optional[Plan] = None
                 plan_fp: str
@@ -808,7 +924,7 @@ class S2Pipeline:
                     else:
                         self.logger.info("s2.plan.cache.miss")
                 if plan is None:
-                    plan = self._build_plan(candidates)
+                    plan = self._build_plan(candidates, candidate_fp)
                     plan_fp = self._fingerprint_plan(plan, candidate_fp)
                     if cache_cfg.plan:
                         self._cache.save_plan(plan, plan_fp, candidate_fp)
@@ -817,47 +933,74 @@ class S2Pipeline:
                     self._write_empty_outputs()
                     return
 
-            with self.logger.stage("Execution"):
+            with self._stage("Execution"):
                 # Execution -------------------------------------------------
-                records: List[PartFeatureRecord]
-                records_fp: str
+                records_fp: Optional[str] = None
+                records_count = 0
                 execution_cached = False
+                execution_path = self.paths.execution_cache
                 if cache_cfg.execution:
-                    cached_exec = self._cache.load_execution(plan_fp)
-                    if cached_exec is not None:
-                        records, stored_records_fp = cached_exec
-                        records_fp = stored_records_fp or self._fingerprint_records(records)
-                        if stored_records_fp is None:
-                            self._cache.save_execution(records, records_fp, plan_fp)
-                        with self._results_lock:
-                            self._results = {record.part_id: record for record in records}
+                    meta = self._cache.execution_cache_meta()
+                    if (
+                        meta
+                        and meta.get("input_fingerprint") == plan_fp
+                        and execution_path.exists()
+                    ):
+                        records_fp = str(meta.get("fingerprint") or "")
+                        records_count = int(meta.get("count", 0) or 0)
+                        if not records_fp:
+                            fp_builder = StreamFingerprint()
+                            for record in self._cache.iter_execution_records():
+                                fp_builder.add_values(
+                                    record.part_id,
+                                    record.content_hash,
+                                    record.geom_hash,
+                                )
+                            records_fp = fp_builder.hexdigest()
+                            self._cache.save_execution_meta(records_fp, plan_fp, records_count)
                         execution_cached = True
-                        self.logger.info("s2.execution.cache.hit", count=len(records))
-                        if self._progress is not None and len(records):
-                            self._progress.add_overall_total(len(records))
-                            self._progress.update_overall(len(records))
+                        self.logger.info(
+                            "s2.execution.cache.hit",
+                            count=records_count,
+                        )
+                        if self._progress is not None and records_count:
+                            self._progress.add_overall_total(records_count)
+                            self._progress.update_overall(records_count)
                             bar = self._progress.create_bar(
                                 "execution",
-                                total=len(records),
+                                total=records_count,
                                 desc="Execution (cache)",
                                 unit="part",
+                                pipeline_stage=self._current_stage,
                             )
                             if bar is not None:
-                                bar.update(len(records))
+                                bar.update(records_count)
                     else:
-                        self.logger.info("s2.execution.cache.miss")
+                        cached_input = (meta or {}).get("input_fingerprint") if cache_cfg.execution else None
+                        if cached_input and cached_input != plan_fp:
+                            self.logger.info(
+                                "s2.execution.cache.stale",
+                                cached_input=str(cached_input),
+                                expected_input=plan_fp,
+                                saved_at=meta.get("saved_at") if meta else None,
+                                count=int(meta.get("count", 0) or 0) if meta else 0,
+                            )
+                        else:
+                            self.logger.info("s2.execution.cache.miss")
                 if not execution_cached:
-                    self._execute_plan(plan)
-                    records = list(self._results.values())
-                    records_fp = self._fingerprint_records(records)
+                    records_count, records_fp = self._execute_plan(plan)
                     if cache_cfg.execution:
-                        self._cache.save_execution(records, records_fp, plan_fp)
-                if not records:
+                        self._cache.save_execution_meta(
+                            records_fp,
+                            plan_fp,
+                            records_count,
+                        )
+                if records_count <= 0 or not records_fp:
                     self.logger.warning("s2.pipeline.no_records")
                     self._write_empty_outputs()
                     return
 
-            with self.logger.stage("Dataframe-build"):
+            with self._stage("Dataframe-build"):
                 # DataFrame -------------------------------------------------
                 df: Optional[pd.DataFrame] = None
                 df_fp = records_fp
@@ -875,18 +1018,19 @@ class S2Pipeline:
                                 total=1,
                                 desc="Dataframe",
                                 unit="stage",
+                                pipeline_stage=self._current_stage,
                             )
                             if bar is not None:
                                 bar.update(1)
                     else:
                         self.logger.info("s2.dataframe.cache.miss")
                 if df is None:
-                    df = self._build_dataframe(records)
+                    df = self._build_dataframe(self._cache.iter_execution_records())
                     df_fp = records_fp
                     if cache_cfg.dataframe:
                         self._cache.save_dataframe(df, df_fp, records_fp)
 
-            with self.logger.stage("Enrichment"):
+            with self._stage("Enrichment"):
                 # Enrichment -------------------------------------------------
                 family_count = 0
                 enrichment_fp: Optional[str] = None
@@ -908,6 +1052,7 @@ class S2Pipeline:
                                 total=1,
                                 desc="Enrichment",
                                 unit="stage",
+                                pipeline_stage=self._current_stage,
                             )
                             if bar is not None:
                                 bar.update(1)
@@ -921,6 +1066,7 @@ class S2Pipeline:
                             total=1,
                             desc="Enrichment",
                             unit="stage",
+                            pipeline_stage=self._current_stage,
                         )
                     self.logger.info("s2.enrichment.start", parts=len(df))
                     enrich_start = time.time()
@@ -941,7 +1087,7 @@ class S2Pipeline:
                 if enriched is None:
                     raise RuntimeError("Enrichment stage did not produce results")
 
-            with self.logger.stage("Outputs"):
+            with self._stage("Outputs"):
                 # Outputs ----------------------------------------------------
                 output_bar: Optional[tqdm] = None
                 if self._progress is not None:
@@ -950,6 +1096,7 @@ class S2Pipeline:
                         total=1,
                         desc="Outputs",
                         unit="stage",
+                        pipeline_stage=self._current_stage,
                     )
                 self.logger.info(
                     "s2.outputs.start",
@@ -957,7 +1104,7 @@ class S2Pipeline:
                     parts=len(enriched),
                 )
                 output_start = time.time()
-                self._write_outputs(enriched, records)
+                self._write_outputs(enriched)
                 output_duration = time.time() - output_start
                 if output_bar is not None:
                     output_bar.update(1)
@@ -978,6 +1125,25 @@ class S2Pipeline:
                 self.logger.info("s2.progress.summary", bar_count=len(stages), stages=list(stages))
             progress.close()
             self._progress = None
+            self._current_stage = None
+
+    @contextmanager
+    def _stage(self, stage_name: str) -> Iterator[None]:
+        previous_stage = self._current_stage
+        if self._progress is not None and previous_stage and previous_stage != stage_name:
+            self._progress.complete_stage(previous_stage)
+        with self.logger.stage(stage_name):
+            self.logger.info("s2.stage.start", stage=stage_name)
+            stage_start = time.time()
+            self._current_stage = stage_name
+            try:
+                yield
+            finally:
+                if self._progress is not None:
+                    self._progress.complete_stage(stage_name)
+                duration = time.time() - stage_start
+                self.logger.info("s2.stage.end", stage=stage_name, seconds=float(duration))
+                self._current_stage = previous_stage
 
     # ------------------------------------------------------------------
     # Discovery and planning
@@ -1014,6 +1180,7 @@ class S2Pipeline:
                 total=total,
                 desc=f"Discovery ({source.dataset})",
                 unit="path",
+                pipeline_stage=self._current_stage,
             )
         indices = set(_loop_log_indices(total))
         for idx, path in enumerate(paths):
@@ -1091,8 +1258,9 @@ class S2Pipeline:
             return [candidates[i] for i in keep]
         return candidates
 
-    def _build_plan(self, candidates: Sequence[PartCandidate]) -> Plan:
-        job_spec = {"job_id": f"s2-{int(time.time())}"}
+    def _build_plan(self, candidates: Sequence[PartCandidate], fingerprint: Optional[str] = None) -> Plan:
+        job_fp = fingerprint or self._fingerprint_candidates(candidates)
+        job_spec = {"job_id": f"s2-{job_fp[:16]}"}
         items: List[ItemRecord] = []
         dataset_counts: Dict[str, int] = {}
         max_items_per_task = 0
@@ -1149,13 +1317,19 @@ class S2Pipeline:
     # ------------------------------------------------------------------
     # Execution
     # ------------------------------------------------------------------
-    def _execute_plan(self, plan: Plan) -> None:
-        pool = TaskPool()
+    def _execute_plan(self, plan: Plan) -> Tuple[int, str]:
+        pool = TaskPool(default_ttl=None)
         pool.put(plan.tasks)
         policy = ExecutorPolicy()
         total_items = sum(len(task.extras.get("items", [])) for task in plan.tasks)
         execution_bar: Optional[tqdm] = None
         execution_managed = False
+        writer: Optional[CSVRecordWriter] = None
+        fingerprint: Optional[StreamFingerprint] = None
+        with self._results_lock:
+            self._execution_seen.clear()
+        writer, fingerprint = self._cache.execution_writer()
+        self._execution_writer = writer
         if total_items > 0:
             miniters = max(1, math.ceil(total_items / 100))
             if self._progress is not None:
@@ -1166,6 +1340,7 @@ class S2Pipeline:
                     desc="Execution (parts)",
                     unit="part",
                     miniters=miniters,
+                    pipeline_stage=self._current_stage,
                 )
                 execution_managed = execution_bar is not None
             if execution_bar is None:
@@ -1192,8 +1367,14 @@ class S2Pipeline:
                 self._progress.update_overall(processed)
             if records:
                 with self._results_lock:
+                    unique_records = []
                     for record in records:
-                        self._results[record.part_id] = record
+                        if record.part_id in self._execution_seen:
+                            continue
+                        self._execution_seen.add(record.part_id)
+                        unique_records.append(record)
+                    if unique_records and self._execution_writer is not None:
+                        self._execution_writer.write_batch(unique_records)
 
         def on_lease(executor: ParallelExecutor, leased: LeasedTask) -> None:
             items = leased.task.extras.get("items", [])
@@ -1240,11 +1421,17 @@ class S2Pipeline:
             if execution_bar is not None and not execution_managed:
                 execution_bar.refresh()
                 execution_bar.close()
+            if self._execution_writer is not None:
+                self._execution_writer.close()
+            self._execution_writer = None
+        count = writer.count() if writer is not None else 0
+        fp = fingerprint.hexdigest() if fingerprint is not None else ""
+        return count, fp
 
     # ------------------------------------------------------------------
     # Dataframe enrichment
     # ------------------------------------------------------------------
-    def _build_dataframe(self, records: Sequence[PartFeatureRecord]) -> pd.DataFrame:
+    def _build_dataframe(self, records: Iterable[PartFeatureRecord]) -> pd.DataFrame:
         rows: List[Dict[str, object]] = []
         for record in records:
             row: Dict[str, object] = {
@@ -1377,50 +1564,113 @@ class S2Pipeline:
         eps: float,
         min_samples: int,
     ) -> List[int]:
+        """
+        使用 FAISS-GPU 构建 top-k kNN 图，按余弦相似度阈值筛边，
+        通过并查集求连通分量作为 family。为兼容旧参数，eps 视为 L2 阈值，
+        先将向量单位化后用 tau = 1 - 0.5*eps^2 转为余弦相似度阈值。
+        若组件内无任何“核心点”（邻居数≥min_samples），整组件标为噪声(-1)。
+        返回值：长度为 n 的整数标签；噪声为 -1，簇从 0 递增。
+        """
         if torch is None or not torch.cuda.is_available():
             raise RuntimeError("CUDA 不可用，无法执行 GPU 聚类。")
-        if descriptor_tensor.is_cuda is False:
-            descriptor_tensor = descriptor_tensor.cuda()
-        n = descriptor_tensor.size(0)
+        if faiss is None:
+            raise RuntimeError("未检测到 faiss，请安装 faiss-gpu。")
+        # 取出并单位化
+        if descriptor_tensor.is_cuda:
+            X = descriptor_tensor.detach().float().cpu().numpy()
+        else:
+            X = descriptor_tensor.detach().float().numpy()
+        n, d = X.shape
         if n == 0:
             return []
         if n == 1:
             return [0]
-        with torch.no_grad():
-            labels = torch.full((n,), -1, dtype=torch.int32, device=descriptor_tensor.device)
-            cluster_id = 0
-            # Process descriptors in batches to reduce peak memory usage and surface progress.
-            batch_size = max(1, min(512, n))
-            processed = 0
-            last_logged_percent = -1
-            for start in range(0, n, batch_size):
-                end = min(start + batch_size, n)
-                batch_indices = torch.arange(start, end, device=descriptor_tensor.device, dtype=torch.long)
-                batch_vecs = descriptor_tensor[batch_indices]
-                distances = torch.cdist(batch_vecs, descriptor_tensor, p=2)
-                for local_idx, global_idx in enumerate(batch_indices.tolist()):
-                    if labels[global_idx] != -1:
-                        continue
-                    neighbours = torch.nonzero(distances[local_idx] <= eps, as_tuple=False).flatten()
-                    if neighbours.numel() < min_samples:
-                        continue
-                    labels[neighbours] = cluster_id
-                    cluster_id += 1
-                processed = end
-                current_percent = int((processed / n) * 100)
-                if current_percent > last_logged_percent:
-                    for percent in range(last_logged_percent + 1, current_percent + 1):
-                        if percent > 100:
-                            break
-                        reported_processed = min(processed, math.ceil((percent / 100) * n))
-                        self.logger.info(
-                            "s2.enrichment.cluster.progress",
-                            processed=reported_processed,
-                            total=n,
-                            percent=percent,
-                        )
-                    last_logged_percent = current_percent
-        return labels.cpu().tolist()
+        # 单位化
+        norms = np.linalg.norm(X, axis=1, keepdims=True).astype("float32")
+        norms[norms == 0.0] = 1.0
+        X = (X / norms).astype("float32")
+        # L2 阈值 → 余弦相似度阈值
+        tau = float(max(-1.0, min(1.0, 1.0 - 0.5 * (eps ** 2))))
+        # 选择 k
+        try:
+            configured_k = int(getattr(self.config.clustering, "knn_k", 96))
+        except Exception:
+            configured_k = 96
+        k = max(configured_k, min_samples + 1)  # 至少覆盖 min_samples
+        k = min(k, n - 1)  # 不要超过样本数
+        if k <= 0:
+            return [0] * n
+        # 建 FAISS 索引（GPU）
+        cpu_index = faiss.IndexFlatIP(d)
+        gpu_index = faiss.index_cpu_to_all_gpus(cpu_index)
+        gpu_index.add(X)
+        # 检索 top-k（含自身）
+        search_k = min(k + 1, n)
+        sims, idxs = gpu_index.search(X, search_k)
+        effective_k = sims.shape[1] - 1
+        if effective_k <= 0:
+            return list(range(n))
+        # 构建边并统计每点满足阈值的邻居数
+        rows = np.repeat(np.arange(n, dtype=np.int64), effective_k)
+        cols = idxs[:, 1 : effective_k + 1].reshape(-1).astype(np.int64)  # 去掉自身
+        ss = sims[:, 1 : effective_k + 1].reshape(-1).astype("float32")
+        mask = (cols >= 0) & (ss >= tau)
+        U = rows[mask]
+        V = cols[mask]
+        # 并查集
+        parent = np.arange(n, dtype=np.int64)
+        rank = np.zeros(n, dtype=np.int8)
+        def find(a: int) -> int:
+            pa = a
+            while parent[pa] != pa:
+                pa = parent[pa]
+            # 路径压缩
+            while parent[a] != a:
+                nxt = parent[a]
+                parent[a] = pa
+                a = nxt
+            return pa
+        def union(a: int, b: int) -> None:
+            ra, rb = find(int(a)), find(int(b))
+            if ra == rb:
+                return
+            if rank[ra] < rank[rb]:
+                parent[ra] = rb
+            elif rank[ra] > rank[rb]:
+                parent[rb] = ra
+            else:
+                parent[rb] = ra
+                rank[ra] += 1
+        # 连边
+        for a, b in zip(U.tolist(), V.tolist()):
+            union(a, b)
+        # 计算邻居数与组件代表
+        neigh_count = np.zeros(n, dtype=np.int32)
+        np.add.at(neigh_count, U, 1)
+        np.add.at(neigh_count, V, 1)
+        roots = np.fromiter((find(i) for i in range(n)), dtype=np.int64, count=n)
+        # 组件是否有核心点
+        comp_has_core = {}
+        for i in range(n):
+            r = int(roots[i])
+            if neigh_count[i] >= min_samples:
+                comp_has_core[r] = True
+            elif r not in comp_has_core:
+                comp_has_core[r] = False
+        # 压缩标签：核心组件给 0..C-1；非核心组件为 -1
+        root_to_label = {}
+        next_label = 0
+        labels = np.empty(n, dtype=np.int64)
+        for i in range(n):
+            r = int(roots[i])
+            if not comp_has_core.get(r, False):
+                labels[i] = -1
+            else:
+                if r not in root_to_label:
+                    root_to_label[r] = next_label
+                    next_label += 1
+                labels[i] = root_to_label[r]
+        return labels.astype(int).tolist()
 
     @staticmethod
     def _format_family_id(label: int, part_id: str) -> str:
@@ -1432,7 +1682,7 @@ class S2Pipeline:
     # ------------------------------------------------------------------
     # Outputs
     # ------------------------------------------------------------------
-    def _write_outputs(self, df: pd.DataFrame, records: Sequence[PartFeatureRecord]) -> None:
+    def _write_outputs(self, df: pd.DataFrame) -> None:
         df = df.copy()
         df["descriptor_json"] = df["descriptor_vector"].apply(lambda arr: json.dumps(list(arr)))
         df["bbox_ratios_json"] = df["bbox_ratios_vector"].apply(lambda arr: json.dumps(list(arr)))
@@ -1457,7 +1707,7 @@ class S2Pipeline:
         )
         family_hist.to_csv(self.paths.family_hist, index=False)
         if self.config.outputs.write_signatures:
-            self._write_signatures(records)
+            self._write_signatures(self._cache.iter_execution_records())
         diagnostics = {
             "total_parts": int(len(df_output)),
             "unique_canonical": int(df_output["duplicate_canonical"].nunique()),
@@ -1473,7 +1723,7 @@ class S2Pipeline:
         with self.paths.diagnostics.open("w", encoding="utf-8") as fh:
             json.dump(diagnostics, fh, indent=2, ensure_ascii=False)
 
-    def _write_signatures(self, records: Sequence[PartFeatureRecord]) -> None:
+    def _write_signatures(self, records: Iterable[PartFeatureRecord]) -> None:
         rows = []
         for rec in records:
             rows.append(

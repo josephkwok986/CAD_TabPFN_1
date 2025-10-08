@@ -12,10 +12,11 @@ import traceback
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Mapping, Optional, Sequence, Tuple, Union
 
-from gpu_resources import GPUDevice, GPUResourceManager
-from logger import StructuredLogger
-from task_pool import LeasedTask, TaskPool
-from task_system_config import get_executor_value
+from .gpu_resources import GPUDevice, GPUResourceManager
+from .logger import StructuredLogger
+from .runtime import AdaptiveDispatchController, get_default_resource_monitor
+from .task_pool import LeasedTask, TaskPool
+from .task_system_config import get_executor_value
 
 
 logger = StructuredLogger.get_logger("cad.parallel_executor")
@@ -63,6 +64,18 @@ class ExecutorPolicy:
     filters: Optional[Mapping[str, object]] = field(default_factory=lambda: _policy_value("filters", dict, default=None))
     requeue_on_failure: bool = field(default_factory=lambda: _policy_value("requeue_on_failure", bool, required=True))
     preferred_gpus: Optional[Tuple[int, ...]] = field(default_factory=_preferred_gpus_value)
+    dispatch_window_multiplier: float = field(default_factory=lambda: _policy_value("dispatch.window_multiplier", float, default=2.0))
+    dispatch_token_initial_rate: float = field(default_factory=lambda: _policy_value("dispatch.token.initial_rate", float, default=64.0))
+    dispatch_token_capacity: int = field(default_factory=lambda: _policy_value("dispatch.token.capacity", int, default=256))
+    dispatch_token_min_rate: float = field(default_factory=lambda: _policy_value("dispatch.token.min_rate", float, default=1.0))
+    dispatch_token_max_rate: Optional[float] = field(default_factory=lambda: _policy_value("dispatch.token.max_rate", float, default=None))
+    dispatch_target_low: float = field(default_factory=lambda: _policy_value("dispatch.target_utilisation.low", float, default=0.75))
+    dispatch_target_high: float = field(default_factory=lambda: _policy_value("dispatch.target_utilisation.high", float, default=0.85))
+    dispatch_evaluation_interval: float = field(default_factory=lambda: _policy_value("dispatch.evaluation_interval", float, default=5.0))
+    dispatch_ema_alpha: float = field(default_factory=lambda: _policy_value("dispatch.ema_alpha", float, default=0.2))
+    dispatch_aimd_step: int = field(default_factory=lambda: _policy_value("dispatch.aimd.step", int, default=1))
+    dispatch_aimd_decay: float = field(default_factory=lambda: _policy_value("dispatch.aimd.decay", float, default=0.5))
+    heartbeat_interval: Optional[float] = field(default_factory=lambda: _policy_value("heartbeat_interval", float, default=None))
 
 
 @dataclass
@@ -86,34 +99,9 @@ class ExecutorEvents:
     on_stop: Callable[["ParallelExecutor"], None] = lambda executor: None
 
 
-class TokenBucket:
-    def __init__(self, rate: float, burst: Optional[int]) -> None:
-        self._rate = rate
-        self._capacity = float(burst if burst is not None else max(1.0, rate))
-        self._tokens = self._capacity
-        self._updated = time.time()
-        self._lock = threading.Lock()
-
-    def acquire(self, amount: float = 1.0) -> None:
-        if self._rate <= 0:
-            return
-        while True:
-            with self._lock:
-                now = time.time()
-                elapsed = now - self._updated
-                self._tokens = min(self._capacity, self._tokens + elapsed * self._rate)
-                self._updated = now
-                if self._tokens >= amount:
-                    self._tokens -= amount
-                    return
-                deficit = (amount - self._tokens) / self._rate if self._rate else 0
-            if deficit > 0:
-                time.sleep(deficit)
-
-
 def _configure_worker_logging(min_level: str) -> None:
     try:
-        from config import Config  # type: ignore
+        from .config import Config  # type: ignore
     except Exception:
         Config = None  # type: ignore
     sinks = []
@@ -166,6 +154,14 @@ def _call_with_timeout(
         return future.result(timeout=timeout)
 
 
+def _heartbeat_pump(result_queue: "mp.Queue[Any]", task_id: str, interval: float, stop_event: threading.Event) -> None:
+    while not stop_event.wait(interval):
+        try:
+            result_queue.put(("hb", task_id))
+        except (EOFError, OSError):
+            break
+
+
 def _worker_main(
     worker_id: int,
     task_queue: "mp.Queue[Optional[LeasedTask]]",
@@ -198,9 +194,22 @@ def _worker_main(
         if leased is None:
             break
         attempt = 0
+        heartbeat_interval = policy.heartbeat_interval
+        if heartbeat_interval is None:
+            heartbeat_interval = max(0.5, policy.lease_ttl * 0.3) if policy.lease_ttl > 0 else 0.0
         while attempt <= policy.max_retries:
             start = time.time()
+            hb_event: Optional[threading.Event] = None
+            hb_thread: Optional[threading.Thread] = None
             try:
+                if heartbeat_interval and heartbeat_interval > 0:
+                    hb_event = threading.Event()
+                    hb_thread = threading.Thread(
+                        target=_heartbeat_pump,
+                        args=(result_queue, leased.task.task_id, heartbeat_interval, hb_event),
+                        daemon=True,
+                    )
+                    hb_thread.start()
                 result = _call_with_timeout(handler, leased, context, policy.task_timeout)
                 latency = time.time() - start
                 result_queue.put(("ack", leased, latency, result))
@@ -218,6 +227,11 @@ def _worker_main(
                     continue
                 result_queue.put(("dead", leased, str(exc), tb, latency))
                 break
+            finally:
+                if hb_event is not None:
+                    hb_event.set()
+                if hb_thread is not None:
+                    hb_thread.join(timeout=0.2)
 
 
 class ParallelExecutor:
@@ -256,6 +270,22 @@ class ParallelExecutor:
         self._active_lock = threading.Lock()
         self._active_tasks = 0
         self._last_idle_log = 0.0
+        self._resource_monitor = get_default_resource_monitor()
+        self._dispatch_controller = AdaptiveDispatchController(
+            max_concurrency=policy.max_concurrency,
+            window_multiplier=policy.dispatch_window_multiplier,
+            initial_rate=policy.dispatch_token_initial_rate,
+            rate_capacity=policy.dispatch_token_capacity,
+            rate_min=policy.dispatch_token_min_rate,
+            rate_max=policy.dispatch_token_max_rate,
+            target_utilisation_low=policy.dispatch_target_low,
+            target_utilisation_high=policy.dispatch_target_high,
+            evaluation_interval=policy.dispatch_evaluation_interval,
+            ema_alpha=policy.dispatch_ema_alpha,
+            aimd_step=policy.dispatch_aimd_step,
+            aimd_decay=policy.dispatch_aimd_decay,
+            resource_monitor=self._resource_monitor,
+        )
         self._events.on_start(self)
         logger.info(
             "executor.start",
@@ -263,11 +293,6 @@ class ParallelExecutor:
             prefetch=policy.prefetch,
             gpu_devices=self._gpu_manager.available(),
             preferred_gpus=list(policy.preferred_gpus) if policy.preferred_gpus else None,
-        )
-        self._rate_limiter = (
-            TokenBucket(policy.rate_limit_per_sec, policy.rate_limit_burst)
-            if policy.rate_limit_per_sec
-            else None
         )
         self._fatal_error: Optional[Exception] = None
         self._fatal_lock = threading.Lock()
@@ -402,29 +427,40 @@ class ParallelExecutor:
                         break
                 if self._stop_event.is_set():
                     break
-                available_slots = self._policy.prefetch - self._task_queue.qsize()
+                queue_size = self._task_queue.qsize()
+                available_slots = max(0, self._policy.prefetch - queue_size)
                 if available_slots <= 0:
                     stats = self._pool.stats()
                     self._log_dispatch_idle("prefetch_full", stats)
                     time.sleep(self._policy.idle_sleep)
                     continue
-                request = min(self._policy.lease_batch_size, available_slots)
-                if request <= 0:
+                desired = min(self._policy.lease_batch_size, available_slots)
+                decision = self._dispatch_controller.compute_budget(
+                    active_tasks=self._active_tasks,
+                    queued=queue_size,
+                    available_slots=available_slots,
+                    desired=desired,
+                )
+                if decision.dispatch <= 0:
                     stats = self._pool.stats()
-                    self._log_dispatch_idle("no_request_capacity", stats)
+                    reason = decision.reason or "controller_block"
+                    self._log_dispatch_idle(reason, stats)
                     time.sleep(self._policy.idle_sleep)
                     continue
+                request = decision.dispatch
                 leased = self._pool.lease(request, self._policy.lease_ttl, filters=self._policy.filters)
                 if not leased:
+                    self._dispatch_controller.refund(request)
                     stats = self._pool.stats()
                     self._log_dispatch_idle("no_visible_tasks", stats)
                     if stats.get("visible", 0) == 0 and self._active_tasks == 0:
                         break
                     time.sleep(self._policy.idle_sleep)
                     continue
+                if len(leased) < request:
+                    self._dispatch_controller.refund(request - len(leased))
+                self._dispatch_controller.on_dispatched(len(leased))
                 for idx, item in enumerate(leased):
-                    if self._rate_limiter is not None:
-                        self._rate_limiter.acquire(1.0)
                     if idx in (0, len(leased) // 2, len(leased) - 1):
                         logger.debug(
                             "executor.leased",
@@ -464,6 +500,10 @@ class ParallelExecutor:
                     self._result_handler(leased, result)
                 except Exception as exc:  # pragma: no cover - handler safety
                     logger.error("executor.result_handler_error", task_id=leased.task.task_id, error=str(exc))
+                processed = int(getattr(result, "processed", 0) or 0)
+                if processed <= 0:
+                    processed = 1
+                self._dispatch_controller.on_completed(processed, latency=latency)
                 self._decrement_active()
             elif msg_type == "retry":
                 _, leased, attempt, error_text = message
@@ -483,7 +523,12 @@ class ParallelExecutor:
                 if not requeue:
                     self._pool.mark_dead(leased.task.task_id, str(error_text))
                     logger.error("executor.task_dead", task_id=leased.task.task_id, error=error_text, traceback=tb)
+                self._dispatch_controller.on_completed(1, latency=latency)
                 self._decrement_active()
+            elif msg_type == "hb":
+                _, task_id = message
+                if not self._pool.heartbeat(task_id):
+                    logger.debug("executor.heartbeat_lost", task_id=task_id)
             else:  # pragma: no cover - defensive
                 logger.warning("executor.unknown_message", message=msg_type)
         logger.info("executor.results.complete")

@@ -74,7 +74,7 @@ except Exception:
     tz = _FallbackTZ()  # type: ignore
 
 try:
-    from config import Config  # type: ignore
+    from .config import Config  # type: ignore
     _CONFIG_IMPORT_ERROR: Optional[Exception] = None
 except Exception as exc:  # pragma: no cover
     Config = None  # type: ignore

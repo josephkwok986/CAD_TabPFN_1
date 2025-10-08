@@ -139,7 +139,7 @@ class PartitionStrategy(str):
 
 def _default_constraints_from_config() -> Mapping[str, Any]:
     try:
-        from config import Config  # type: ignore
+        from .config import Config  # type: ignore
         cfg = Config.get_singleton()
     except Exception:
         return {}
@@ -152,7 +152,7 @@ def _default_constraints_from_config() -> Mapping[str, Any]:
 
 def _default_meta_from_config() -> Mapping[str, Any]:
     try:
-        from config import Config  # type: ignore
+        from .config import Config  # type: ignore
         cfg = Config.get_singleton()
     except Exception:
         return {}

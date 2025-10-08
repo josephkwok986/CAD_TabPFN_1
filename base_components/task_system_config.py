@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from config import Config
+from .config import Config
 
 _TASK_CONFIG_ENV = "CAD_TASK_CONFIG"
 _DEFAULT_CONFIG_NAME = "main.yaml"

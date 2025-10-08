@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence, Tuple
 
-from config import Config
+from base_components.config import Config
 
 
 _DEFAULT_EXTENSIONS = (".step", ".stp", ".stpz", ".brep", ".brp")
@@ -151,17 +151,38 @@ class ClusteringSettings:
     eps: float
     min_samples: int
     auto_eps: AutoEpsSettings
+    knn_k: int
 
     @classmethod
     def from_mapping(cls, data: Optional[Mapping[str, Any]]) -> "ClusteringSettings":
         if data is None:
-            return cls(method="dbscan", eps=0.012, min_samples=6, auto_eps=AutoEpsSettings.from_mapping(None))
+            return cls(
+                method="dbscan",
+                eps=0.012,
+                min_samples=6,
+                auto_eps=AutoEpsSettings.from_mapping(None),
+                knn_k=96,
+            )
         auto = AutoEpsSettings.from_mapping(data.get("auto_eps"))
+        knn_raw = data.get("knn_k")
+        if knn_raw is None:
+            knn_raw = data.get("knn")
+        if knn_raw is None:
+            knn_raw = data.get("k")
+        if knn_raw is None:
+            knn_k = 96
+        else:
+            try:
+                knn_k = int(knn_raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("pipelines.s2.clustering.knn_k must be an integer") from exc
+        knn_k = max(8, knn_k)
         return cls(
             method=str(data.get("method", "dbscan")),
             eps=float(data.get("eps", data.get("distance_threshold", 0.012))),
             min_samples=int(data.get("min_samples", 6)),
             auto_eps=auto,
+            knn_k=knn_k,
         )
 
 
