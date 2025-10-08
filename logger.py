@@ -260,13 +260,25 @@ class Sink:
 
 
 class ConsoleSink(Sink):
-    def __init__(self, stream: str = "stdout") -> None:
+    def __init__(self, stream: str = "stdout", min_level: Optional[str] = None) -> None:
         if stream not in {"stdout", "stderr"}:
             raise ValueError("stream must be 'stdout' or 'stderr'")
         self._stream = sys.stdout if stream == "stdout" else sys.stderr
         self._lock = threading.Lock()
+        if min_level is not None:
+            level_value = _LEVEL_MAP.get(min_level.upper())
+            if level_value is None:
+                raise ValueError(f"Unknown min_level for ConsoleSink: {min_level}")
+            self._min_level = level_value
+        else:
+            self._min_level = None
 
     def emit(self, record: Dict[str, Any], serialized: str) -> None:
+        if self._min_level is not None:
+            level_name = str(record.get("level", "INFO")).upper()
+            level_value = _LEVEL_MAP.get(level_name, 0)
+            if level_value < self._min_level:
+                return
         with self._lock:
             self._stream.write(serialized + "\n")
             self._stream.flush()
@@ -601,7 +613,10 @@ class StructuredLogger:
             return spec
         typ = spec.get("type")
         if typ == "console":
-            return ConsoleSink(stream=spec.get("stream", "stdout"))
+            return ConsoleSink(
+                stream=spec.get("stream", "stdout"),
+                min_level=spec.get("min_level"),
+            )
         if typ in {"file", "rotating_file"}:
             return RotatingFileSink(
                 path=spec["path"],

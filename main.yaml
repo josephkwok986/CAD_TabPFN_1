@@ -27,6 +27,7 @@ logger:
   sinks:
     - type: console
       stream: stdout
+      min_level: WARN
     - type: rotating_file
       path: logs/app.log
       max_bytes: 10485760
@@ -126,4 +127,3 @@ pipelines:
     quarantine:
       preferred_tier: gold
       reason: cross_tier_duplicate
-

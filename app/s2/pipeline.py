@@ -88,6 +88,84 @@ class S2Paths:
         )
 
 
+class PipelineProgressTracker:
+    """Manage tqdm progress bars for the pipeline."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._bars: List[tqdm] = []
+        self._position = 1  # position 0 is reserved for the overall bar
+        self._overall: Optional[tqdm] = None
+        self._stages: set[str] = set()
+
+    def ensure_overall(self, *, desc: str, unit: str) -> Optional[tqdm]:
+        if self._overall is not None:
+            return self._overall
+        bar = tqdm(
+            total=0,
+            desc=desc,
+            unit=unit,
+            position=0,
+            leave=True,
+            dynamic_ncols=True,
+            file=sys.stdout,
+            disable=False,
+        )
+        with self._lock:
+            if self._overall is None:
+                self._overall = bar
+                self._bars.append(bar)
+                self._stages.add("overall")
+                self._position = max(self._position, 1)
+            else:  # pragma: no cover - defensive
+                bar.close()
+        return self._overall
+
+    def create_bar(self, stage: str, **kwargs) -> Optional[tqdm]:
+        with self._lock:
+            position = self._position
+            self._position += 1
+        kwargs.setdefault("position", position)
+        kwargs.setdefault("dynamic_ncols", True)
+        kwargs.setdefault("leave", True)
+        kwargs.setdefault("file", sys.stdout)
+        kwargs.setdefault("disable", False)
+        bar = tqdm(**kwargs)
+        with self._lock:
+            self._bars.append(bar)
+            self._stages.add(stage)
+        return bar
+
+    def add_overall_total(self, amount: int) -> None:
+        bar = self._overall
+        if bar is None:
+            return
+        with self._lock:
+            bar.total = (bar.total or 0) + amount
+        bar.refresh()
+
+    def update_overall(self, amount: int = 1) -> None:
+        bar = self._overall
+        if bar is None:
+            return
+        bar.update(amount)
+
+    def stages(self) -> Tuple[str, ...]:
+        with self._lock:
+            return tuple(sorted(self._stages))
+
+    def close(self) -> None:
+        with self._lock:
+            bars = list(self._bars)
+            self._bars.clear()
+            self._stages.clear()
+            self._overall = None
+            self._position = 1
+        for bar in bars:
+            bar.refresh()
+            bar.close()
+
+
 def _loop_log_indices(total: int) -> Tuple[int, ...]:
     if total <= 0:
         return tuple()
@@ -107,6 +185,7 @@ class S2Pipeline:
         self._candidate_by_index: Dict[int, PartCandidate] = {}
         self._results: Dict[str, PartFeatureRecord] = {}
         self._results_lock = threading.RLock()
+        self._progress: Optional[PipelineProgressTracker] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -114,34 +193,44 @@ class S2Pipeline:
     def run(self) -> None:
         if pd is None:
             raise RuntimeError("pandas is required to run the S2 pipeline. Install pandas>=1.3.")
+        progress = PipelineProgressTracker()
+        self._progress = progress
+        progress.ensure_overall(desc="S2 pipeline (overall)", unit="work")
         self.logger.info(
             "s2.pipeline.start",
             sources=len(self.config.sources),
             output_root=str(self.paths.root),
         )
-        ensure_task_config()
-        self.paths.root.mkdir(parents=True, exist_ok=True)
-        candidates = self._discover_candidates()
-        if not candidates:
-            self.logger.warning("s2.pipeline.empty_sources")
-            self._write_empty_outputs()
-            return
-        plan = self._build_plan(candidates)
-        self._execute_plan(plan)
-        records = list(self._results.values())
-        if not records:
-            self.logger.warning("s2.pipeline.no_records")
-            self._write_empty_outputs()
-            return
-        df = self._build_dataframe(records)
-        enriched = self._enrich_dataframe(df)
-        self._write_outputs(enriched, records)
-        self.logger.info(
-            "s2.pipeline.completed",
-            parts=len(enriched),
-            families=int(enriched["family_id"].nunique()),
-            cross_tier_quarantine=int(enriched["cross_tier_quarantine"].sum()),
-        )
+        self.logger.info("s2.progress.layout", bars=list(progress.stages()))
+        try:
+            ensure_task_config()
+            self.paths.root.mkdir(parents=True, exist_ok=True)
+            candidates = self._discover_candidates()
+            if not candidates:
+                self.logger.warning("s2.pipeline.empty_sources")
+                self._write_empty_outputs()
+                return
+            plan = self._build_plan(candidates)
+            self._execute_plan(plan)
+            records = list(self._results.values())
+            if not records:
+                self.logger.warning("s2.pipeline.no_records")
+                self._write_empty_outputs()
+                return
+            df = self._build_dataframe(records)
+            enriched = self._enrich_dataframe(df)
+            self._write_outputs(enriched, records)
+            self.logger.info(
+                "s2.pipeline.completed",
+                parts=len(enriched),
+                families=int(enriched["family_id"].nunique()),
+                cross_tier_quarantine=int(enriched["cross_tier_quarantine"].sum()),
+            )
+        finally:
+            stages = progress.stages()
+            self.logger.info("s2.progress.summary", bar_count=len(stages), stages=list(stages))
+            progress.close()
+            self._progress = None
 
     # ------------------------------------------------------------------
     # Discovery and planning
@@ -169,8 +258,21 @@ class S2Pipeline:
         pattern = source.pattern
         paths = sorted(root.rglob(pattern)) if pattern else sorted(root.rglob("*"))
         total = len(paths)
+        progress_bar: Optional[tqdm] = None
+        if self._progress is not None and total:
+            self._progress.add_overall_total(total)
+            progress_bar = self._progress.create_bar(
+                f"discover:{source.dataset}",
+                total=total,
+                desc=f"Discovery ({source.dataset})",
+                unit="path",
+            )
         indices = set(_loop_log_indices(total))
         for idx, path in enumerate(paths):
+            if progress_bar is not None:
+                progress_bar.update(1)
+            if self._progress is not None and total:
+                self._progress.update_overall(1)
             if not path.is_file():
                 continue
             if allowed and path.suffix.lower() not in allowed:
@@ -227,15 +329,39 @@ class S2Pipeline:
     def _build_plan(self, candidates: Sequence[PartCandidate]) -> Plan:
         job_spec = {"job_id": f"s2-{int(time.time())}"}
         items: List[ItemRecord] = []
+        dataset_counts: Dict[str, int] = {}
+        max_items_per_task = 0
+        raw_max_items = self.config.partition.constraints.get("max_items_per_task")
+        if raw_max_items is not None:
+            try:
+                max_items_per_task = int(raw_max_items)
+            except (TypeError, ValueError):
+                max_items_per_task = 0
+            if max_items_per_task < 0:
+                max_items_per_task = 0
         for idx, candidate in enumerate(candidates):
             self._candidate_by_index[idx] = candidate
             weight = max(1.0, candidate.file_size / 1024.0)
+            dataset_counts.setdefault(candidate.dataset, 0)
+            count = dataset_counts[candidate.dataset]
+            dataset_counts[candidate.dataset] = count + 1
+            if max_items_per_task:
+                chunk_index = count // max_items_per_task
+                group_key = f"{candidate.dataset}#{chunk_index:06d}"
+            else:
+                group_key = candidate.dataset
+            metadata = {
+                "dataset": candidate.dataset,
+                "tier": candidate.dataset_tier,
+            }
+            if max_items_per_task:
+                metadata["dataset_chunk"] = group_key
             items.append(
                 ItemRecord(
                     payload_ref=f"{candidate.dataset}:{candidate.part_id}",
                     weight=weight,
-                    group_key=candidate.dataset,
-                    metadata={"dataset": candidate.dataset, "tier": candidate.dataset_tier},
+                    group_key=group_key,
+                    metadata=metadata,
                     checksum=None,
                     raw={},
                     index=idx,
@@ -268,24 +394,39 @@ class S2Pipeline:
             for task in plan.tasks
         }
         total_items = sum(len(indexes) for indexes in indices_cache.values())
-        progress = None
+        execution_bar: Optional[tqdm] = None
+        execution_managed = False
         if total_items > 0:
             miniters = max(1, math.ceil(total_items / 100))
-            progress = tqdm(
-                total=total_items,
-                desc="S2 pipeline",
-                unit="part",
-                miniters=miniters,
-                leave=True,
-                dynamic_ncols=True,
-                file=sys.stdout,
-                disable=False,
-            )
-            progress.refresh()
+            if self._progress is not None:
+                self._progress.add_overall_total(total_items)
+            if self._progress is not None:
+                execution_bar = self._progress.create_bar(
+                    "execution",
+                    total=total_items,
+                    desc="Execution (parts)",
+                    unit="part",
+                    miniters=miniters,
+                )
+                execution_managed = execution_bar is not None
+            if execution_bar is None:
+                execution_bar = tqdm(
+                    total=total_items,
+                    desc="S2 pipeline",
+                    unit="part",
+                    miniters=miniters,
+                    leave=True,
+                    dynamic_ncols=True,
+                    file=sys.stdout,
+                    disable=False,
+                )
+            execution_bar.refresh()
 
         def update_progress(amount: int = 1) -> None:
-            if progress is not None:
-                progress.update(amount)
+            if execution_bar is not None:
+                execution_bar.update(amount)
+            if self._progress is not None:
+                self._progress.update_overall(amount)
 
         def handler(leased) -> None:
             indexes = indices_cache.get(leased.task.task_id, tuple())
@@ -313,9 +454,9 @@ class S2Pipeline:
         try:
             ParallelExecutor.run(handler, pool, policy)
         finally:
-            if progress is not None:
-                progress.refresh()
-                progress.close()
+            if execution_bar is not None and not execution_managed:
+                execution_bar.refresh()
+                execution_bar.close()
 
     # ------------------------------------------------------------------
     # Feature extraction
