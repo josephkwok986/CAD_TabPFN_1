@@ -370,6 +370,7 @@ class _TaskBuilder:
         if self.constraints.anti_affinity:
             extras["anti_affinity"] = dict(self.constraints.anti_affinity)
         extras["checksum_inputs"] = [item.checksum for item in self.items]
+        extras["items"] = [item.raw for item in self.items]
         return TaskRecord(
             task_id=task_id,
             job_id=self.job_id,

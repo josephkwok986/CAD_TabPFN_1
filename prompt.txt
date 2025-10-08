@@ -1,5 +1,47 @@
 'EOF'
 
-1.修改控制台仅输出 WARN 或 ERROR 等以上级别的警告或错误日志。
+Execution (parts):  20%|███████████  
+好像卡在了20%了，我看cpu gpu利用率都很低，你也可以执行命令（如nvidia-smi之类）查看一下，另外看看日志什么的排查一下。
+
+现在在运行，你可以检查一下看看，我感觉好像卡死在Execution 的4%了。后续都用中文回答。
+
+1.感觉不正常，整个机器利用率很低，而且磁盘IO也不高。你再排查一下，现在可能卡死4%已经超过10分钟了。
+2.
+“5.防止卡死：
+子进程软超时：SIGALRM 每件限时，超时抛出并标注 timeout。主进程硬看门狗按周期巡检，发现超龄 future 记为 hard_timeout，写日志。随后强制杀子进程并重启进程池，将未完成任务回队列重投。注意出现“硬看门狗重启进程池时只把“超龄 in-flight 任务”的一部分重新提交，剩余的未回队列，出现“无完成也无超龄”的空转，触发卡死””
+你思考一下，上述这个设计，是否可能是卡死的原因或解决目前卡死的问题？
+
+
+好，那优先通过加日志/捕获异常找出原因吧。
+
+pkill -9 -f "python -m app.s2.pipeline"
+
+
+{"ts":"2025-10-08T06:45:50.991184Z","ts_local":"2025-10-08T07:45:50.991184+01:00","level":"INFO","event":"task.ack","logger":"cad.task_pool","file":"/workspace/Gjj Doc/Code/CAD_TabPFN_1/task_pool.py:201","task_id":"135bd472a614327da5e57138188a4986","attempt":1,"extras":null}
+{"ts":"2025-10-08T06:45:50.993919Z","ts_local":"2025-10-08T07:45:50.993919+01:00","level":"INFO","event":"s2.task.start","logger":"cad.s2.pipeline","file":"/workspace/Gjj Doc/Code/CAD_TabPFN_1/app/s2/pipeline.py:1064","task_id":"21567e0937b9e5a76fba8ad80d91f536","extras":{"items":8}}
+{"ts":"2025-10-08T06:45:51.003008Z","ts_local":"2025-10-08T07:45:51.003008+01:00","level":"INFO","event":"task.ack","logger":"cad.task_pool","file":"/workspace/Gjj Doc/Code/CAD_TabPFN_1/task_pool.py:201","task_id":"224591c741ce80349e3ef04d3232c23e","attempt":1,"extras":null}
+{"ts":"2025-10-08T06:45:51.006436Z","ts_local":"2025-10-08T07:45:51.006436+01:00","level":"INFO","event":"s2.task.start","logger":"cad.s2.pipeline","file":"/workspace/Gjj Doc/Code/CAD_TabPFN_1/app/s2/pipeline.py:1064","task_id":"aeae9b9dd0864b122d381eb88a9cdf17","extras":{"items":8}}
+1.这些日志打印太多了，要大量减少它，可以只抽取1%进行打印
+2.每个日志应该都加上所在阶段，如Execution
+3.各个所有阶段输出的结果，都以CSV格式的写入磁盘（读取当然也应该用CSV格式。）
+
+不需要保留对旧版 JSON 缓存的兼容读取这部分代码和逻辑了。
+
+
+1.所有日志都要加上 "stage" 字段（例如"stage":"Execution"，或"stage":"Discovery"等.总共应该有Discovery Planning Execution Dataframe-build Enrichment Outputs 等阶段。
+2.现在 Execution 好像卡死在 32%了，整个机器利用率很低，而且磁盘IO也不高，感觉不对。你再排查一下。可以看日志，看机器进程状态等都可以。
+
+
+1.控制台显示 Execution (parts):  32%
+为什么说 Execution 已经执行完了呢？这里要么阶段显示不对，要么调查有问题。
+2.所有回答，包括现在和后续的，都使用中文
+
+1.每个阶段在开始和结束时都输出一条日志，并有stage"字段。
+2.在阶段切换时，直接把切换前的进度条设置为100%
+
+
+1.每个阶段在开始和结束时都输出一条日志，并有stage"字段。
+2.为什么 Execution 阶段容易卡死呢？是不是内存不足或显存不足导致某个进程被KILL了？
+
 
 EOF

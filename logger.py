@@ -34,6 +34,7 @@ import io
 import json
 import logging
 import logging.handlers
+import os
 import random
 import sys
 import threading
@@ -41,7 +42,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, MutableMapping, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, MutableMapping, Optional, Tuple
 
 try:  # Prefer ultra fast JSON serialiser when available.
     import orjson as _orjson  # type: ignore
@@ -105,6 +106,7 @@ _STANDARD_FIELDS = {
     "file",
     "level",
     "extras",
+    "stage",
 }
 
 _SECRET_PATTERNS = (
@@ -115,6 +117,8 @@ _SECRET_PATTERNS = (
     "credential",
     "pwd",
 )
+
+_DEFAULT_STAGE = "Discovery"
 
 
 def _utcnow() -> _dt.datetime:
@@ -127,7 +131,7 @@ def _isoformat(dt: _dt.datetime) -> str:
     return dt.astimezone(tz.tzutc()).isoformat().replace("+00:00", "Z")
 
 
-def _safe_summary(value: Any, *, max_length: int = 512) -> Any:
+def _safe_summary(value: Any, *, max_length: int = 16384) -> Any:
     """Return a representation safe for JSON serialisation."""
     if value is None or isinstance(value, (bool, int, float)):
         return value
@@ -286,8 +290,25 @@ class ConsoleSink(Sink):
 
 class RotatingFileSink(Sink):
     def __init__(self, path: str, max_bytes: int = 10 * 1024 * 1024, backups: int = 5) -> None:
-        self._path = Path(path)
-        self._path.parent.mkdir(parents=True, exist_ok=True)
+        realpath = os.path.realpath(path)
+        self._path = Path(realpath)
+        parent = self._path.parent
+        parent.mkdir(parents=True, exist_ok=True)
+        if not self._path.exists():
+            retries = 0
+            while retries < 8:
+                try:
+                    fd = os.open(realpath, os.O_APPEND | os.O_CREAT, 0o644)
+                    os.close(fd)
+                    break
+                except FileNotFoundError:
+                    time.sleep(0.2)
+                    retries += 1
+            else:
+                parent_listing = list(parent.parent.glob("*"))
+                raise FileNotFoundError(
+                    f"无法创建日志文件: {self._path}；上层目录内容: {parent_listing}"
+                )
         self._handler = logging.handlers.RotatingFileHandler(
             filename=str(self._path),
             maxBytes=int(max_bytes),
@@ -524,6 +545,18 @@ class StructuredLogger:
             current.pop(key, None)
         self._context.set(current)
 
+    @contextlib.contextmanager
+    def stage(self, stage: str) -> Iterator[None]:
+        previous = dict(self._context.get()).get("stage")
+        self.bind(stage=stage)
+        try:
+            yield
+        finally:
+            if previous is None:
+                self.unbind("stage")
+            else:
+                self.bind(stage=previous)
+
     # Logging -------------------------------------------------------
     def debug(self, event: str, **fields: Any) -> bool:
         return self._log("DEBUG", event, fields)
@@ -582,9 +615,20 @@ class StructuredLogger:
             "attempt",
             "latency_ms",
             "msg",
+            "stage",
         ]:
             if key in redacted:
                 record[key] = redacted.pop(key)
+        stage_value = record.get("stage")
+        if not (isinstance(stage_value, str) and stage_value.strip()):
+            candidate = combined.get("stage")
+            if isinstance(candidate, str) and candidate.strip():
+                stage_value = candidate.strip()
+            elif candidate is not None and str(candidate).strip():
+                stage_value = str(candidate).strip()
+            else:
+                stage_value = _DEFAULT_STAGE
+        record["stage"] = stage_value
         extras = {k: v for k, v in redacted.items() if k not in _STANDARD_FIELDS}
         record["extras"] = extras or None
         return record
@@ -618,11 +662,16 @@ class StructuredLogger:
                 min_level=spec.get("min_level"),
             )
         if typ in {"file", "rotating_file"}:
-            return RotatingFileSink(
-                path=spec["path"],
-                max_bytes=int(spec.get("max_bytes", 10 * 1024 * 1024)),
-                backups=int(spec.get("backups", 5)),
-            )
+            try:
+                return RotatingFileSink(
+                    path=spec["path"],
+                    max_bytes=int(spec.get("max_bytes", 10 * 1024 * 1024)),
+                    backups=int(spec.get("backups", 5)),
+                )
+            except FileNotFoundError as exc:
+                raise RuntimeError(
+                    f"无法创建日志文件 {spec.get('path')}: {exc}"
+                ) from exc
         if typ == "syslog":
             return SyslogSink(
                 address=spec.get("address"),

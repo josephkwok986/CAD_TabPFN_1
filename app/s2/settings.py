@@ -48,18 +48,27 @@ class SourceSettings:
 class SamplingSettings:
     subset_n: Optional[int]
     subset_frac: Optional[float]
+    probability: float
     seed: int
 
     @classmethod
     def from_mapping(cls, data: Optional[Mapping[str, Any]]) -> "SamplingSettings":
         if data is None:
-            return cls(subset_n=None, subset_frac=None, seed=42)
+            return cls(subset_n=None, subset_frac=None, probability=1.0, seed=42)
         subset_n = data.get("subset_n")
         subset_frac = data.get("subset_frac")
+        probability_raw = data.get("probability", 1.0)
+        try:
+            probability = float(probability_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("pipelines.s2.sampling.probability must be numeric") from exc
+        if probability < 0.0 or probability > 1.0:
+            raise ValueError("pipelines.s2.sampling.probability must be between 0.0 and 1.0")
         seed = int(data.get("seed", 42))
         return cls(
             subset_n=int(subset_n) if subset_n is not None else None,
             subset_frac=float(subset_frac) if subset_frac is not None else None,
+            probability=probability,
             seed=seed,
         )
 
@@ -78,6 +87,27 @@ class FeatureSettings:
             descriptor_length=int(data.get("descriptor_length", 64)),
             sample_points=int(data.get("sample_points", 4096)),
             random_seed=int(data.get("random_seed", 1337)),
+        )
+
+
+@dataclass(frozen=True)
+class StageCacheSettings:
+    discovery: bool
+    plan: bool
+    execution: bool
+    dataframe: bool
+    enrichment: bool
+
+    @classmethod
+    def from_mapping(cls, data: Optional[Mapping[str, Any]]) -> "StageCacheSettings":
+        if data is None:
+            return cls(discovery=False, plan=False, execution=False, dataframe=False, enrichment=False)
+        return cls(
+            discovery=bool(data.get("discovery", False)),
+            plan=bool(data.get("plan", False)),
+            execution=bool(data.get("execution", False)),
+            dataframe=bool(data.get("dataframe", False)),
+            enrichment=bool(data.get("enrichment", False)),
         )
 
 
@@ -146,6 +176,13 @@ class PartitionSettings:
             return cls(strategy="weighted", constraints={"max_items_per_task": 64, "shuffle_seed": 42})
         strategy = str(data.get("strategy", "weighted"))
         constraints = dict(data.get("constraints", {}))
+        # Normalize known numeric constraints so downstream arithmetic works even if YAML/overrides provide strings.
+        for key in ("max_items_per_task", "shuffle_seed"):
+            if key in constraints and constraints[key] is not None:
+                try:
+                    constraints[key] = int(constraints[key])
+                except (TypeError, ValueError):
+                    raise ValueError(f"pipelines.s2.partition.constraints.{key} must be an integer")
         return cls(strategy=strategy, constraints=constraints)
 
 
@@ -196,6 +233,7 @@ class S2PipelineConfig:
     dedup: DedupSettings
     clustering: ClusteringSettings
     partition: PartitionSettings
+    stage_cache: StageCacheSettings
     outputs: OutputSettings
     quarantine: QuarantineSettings
 
@@ -214,6 +252,7 @@ class S2PipelineConfig:
         dedup = DedupSettings.from_mapping(data.get("dedup"))
         clustering = ClusteringSettings.from_mapping(data.get("clustering"))
         partition = PartitionSettings.from_mapping(data.get("partition"))
+        stage_cache = StageCacheSettings.from_mapping(data.get("stage_cache"))
         outputs = OutputSettings.from_mapping(data.get("outputs", {}))
         quarantine = QuarantineSettings.from_mapping(data.get("quarantine"))
         return cls(
@@ -223,6 +262,7 @@ class S2PipelineConfig:
             dedup=dedup,
             clustering=clustering,
             partition=partition,
+            stage_cache=stage_cache,
             outputs=outputs,
             quarantine=quarantine,
         )

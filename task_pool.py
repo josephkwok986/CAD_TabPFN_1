@@ -7,6 +7,7 @@ from __future__ import annotations
 import heapq
 import json
 import os
+import random
 import threading
 import time
 import uuid
@@ -198,7 +199,8 @@ class InMemoryBackend(TaskPoolBackend):
             entry = self._leased.pop(task_id, None)
             if entry is None:
                 return False
-            logger.info("task.ack", task_id=task_id, attempt=entry.attempt)
+            if random.random() <= 0.01:
+                logger.info("task.ack", task_id=task_id, attempt=entry.attempt, stage="Execution")
             return True
 
     def nack(self, task_id: str, *, requeue: bool, delay: Optional[float]) -> bool:

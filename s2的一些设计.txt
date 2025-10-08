@@ -1,0 +1,22 @@
+• 阶段概览
+
+  - Discovery：逐个源目录扫描、过滤扩展名、统计候选件（app/s2/pipeline.py:330 起）。纯 CPU+IO，主要受存储吞吐影响，是当
+    前流程里最耗时的阶段——你这次跑日志里 3 个源分别用了 ~10m28s、~5m46s、~4m31s。
+  - Planning：把候选件切分成任务计划（app/s2/pipeline.py:402 起）。在内存里整合权重、分组，规模线性，通常只需几十秒甚至
+    更短。
+  - Execution：并行 worker 对每件零件读取文件、算特征、写入结果缓存（app/s2/pipeline.py:474 起）。现有 handler 全走
+    CPU；GPU 资源虽然可配置但默认没用。耗时取决于零件数量和并发度，一般是 Discovery 之后最长的阶段。
+  - Dataframe build：把累积的结果映射成 pandas DataFrame（app/s2/pipeline.py:542）。纯 CPU，次数一次，耗时很短（秒级）。
+  - Enrichment：在 DataFrame 上做去重、相似度、聚类（app/s2/pipeline.py:558）。这里强制要求 PyTorch+CUDA，可见
+    torch.cuda.is_available() 的检查；计算都在 GPU 上完成。耗时通常排第三，取决于零件数和 GPU 性能；对 20–30 万件的批次
+    常在几分钟内。
+  - Outputs：写 parquet/CSV/JSON（app/s2/pipeline.py:606）。IO 为主，通常是所有阶段里最短的（秒到几十秒）。
+
+  耗时排序（长 → 短）
+
+  1. Discovery（强依赖磁盘/网络 IO）
+  2. Execution（受并发、CPU、磁盘影响）
+  3. Enrichment（GPU 加速，相对稳定）
+  4. Planning
+  5. Dataframe build
+  6. Outputs
