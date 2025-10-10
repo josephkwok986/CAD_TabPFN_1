@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import concurrent.futures
+import csv
+import json
 import os
 import multiprocessing as mp
 import queue
@@ -10,11 +12,11 @@ import threading
 import time
 import traceback
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Mapping, Optional, Sequence, Tuple, Union
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from .gpu_resources import GPUDevice, GPUResourceManager
 from .logger import StructuredLogger
-from .runtime import AdaptiveDispatchController, get_default_resource_monitor
 from .task_pool import LeasedTask, TaskPool
 from .task_system_config import get_executor_value
 
@@ -58,31 +60,27 @@ class ExecutorPolicy:
     backoff_base: float = field(default_factory=lambda: _policy_value("backoff_base", float, required=True))
     backoff_jitter: float = field(default_factory=lambda: _policy_value("backoff_jitter", float, required=True))
     task_timeout: Optional[float] = field(default_factory=lambda: _policy_value("task_timeout", float, default=None))
-    rate_limit_per_sec: Optional[float] = field(default_factory=lambda: _policy_value("rate_limit_per_sec", float, default=None))
-    rate_limit_burst: Optional[int] = field(default_factory=lambda: _policy_value("rate_limit_burst", int, default=None))
     failure_delay: Optional[float] = field(default_factory=lambda: _policy_value("failure_delay", float, default=None))
     filters: Optional[Mapping[str, object]] = field(default_factory=lambda: _policy_value("filters", dict, default=None))
     requeue_on_failure: bool = field(default_factory=lambda: _policy_value("requeue_on_failure", bool, required=True))
     preferred_gpus: Optional[Tuple[int, ...]] = field(default_factory=_preferred_gpus_value)
-    dispatch_window_multiplier: float = field(default_factory=lambda: _policy_value("dispatch.window_multiplier", float, default=2.0))
-    dispatch_token_initial_rate: float = field(default_factory=lambda: _policy_value("dispatch.token.initial_rate", float, default=64.0))
-    dispatch_token_capacity: int = field(default_factory=lambda: _policy_value("dispatch.token.capacity", int, default=256))
-    dispatch_token_min_rate: float = field(default_factory=lambda: _policy_value("dispatch.token.min_rate", float, default=1.0))
-    dispatch_token_max_rate: Optional[float] = field(default_factory=lambda: _policy_value("dispatch.token.max_rate", float, default=None))
-    dispatch_target_low: float = field(default_factory=lambda: _policy_value("dispatch.target_utilisation.low", float, default=0.75))
-    dispatch_target_high: float = field(default_factory=lambda: _policy_value("dispatch.target_utilisation.high", float, default=0.85))
-    dispatch_evaluation_interval: float = field(default_factory=lambda: _policy_value("dispatch.evaluation_interval", float, default=5.0))
-    dispatch_ema_alpha: float = field(default_factory=lambda: _policy_value("dispatch.ema_alpha", float, default=0.2))
-    dispatch_aimd_step: int = field(default_factory=lambda: _policy_value("dispatch.aimd.step", int, default=1))
-    dispatch_aimd_decay: float = field(default_factory=lambda: _policy_value("dispatch.aimd.decay", float, default=0.5))
     heartbeat_interval: Optional[float] = field(default_factory=lambda: _policy_value("heartbeat_interval", float, default=None))
 
 
 @dataclass
 class TaskResult:
+    """Outcome of a task execution.
+
+    Handlers must populate output_directory, output_filename, and is_final_output
+    so workers can persist results immediately without keeping payloads in memory.
+    """
     payload: Any = None
     processed: int = 0
-    metadata: Mapping[str, Any] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    output_directory: Optional[str] = None
+    output_filename: Optional[str] = None
+    is_final_output: Optional[bool] = None
+    written_path: Optional[str] = None
 
 
 @dataclass
@@ -162,6 +160,95 @@ def _heartbeat_pump(result_queue: "mp.Queue[Any]", task_id: str, interval: float
             break
 
 
+def _ensure_parent_dir(path: Path) -> None:
+    """Create parent directories so we can flush results immediately."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _normalise_rows(payload: Any) -> List[Dict[str, Any]]:
+    if payload is None:
+        return []
+    if isinstance(payload, Mapping):
+        return [dict(payload)]
+    if isinstance(payload, Sequence) and not isinstance(payload, (str, bytes, bytearray)):
+        rows: List[Dict[str, Any]] = []
+        for item in payload:
+            if isinstance(item, Mapping):
+                rows.append(dict(item))
+            else:
+                raise TypeError("Intermediate payload must be a sequence of mappings to form CSV rows.")
+        return rows
+    raise TypeError("Intermediate payload must provide tabular data (mapping or list of mappings).")
+
+
+def _write_csv_output(destination: Path, payload: Any) -> None:
+    if hasattr(payload, "to_csv") and callable(getattr(payload, "to_csv")):
+        _ensure_parent_dir(destination)
+        payload.to_csv(destination, index=False)
+        return
+    rows = _normalise_rows(payload)
+    _ensure_parent_dir(destination)
+    if not rows:
+        destination.write_text("", encoding="utf-8")
+        return
+    fieldnames: List[str] = sorted({key for row in rows for key in row.keys()})
+    with destination.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field, "") for field in fieldnames})
+
+
+def _write_final_output(destination: Path, payload: Any) -> None:
+    _ensure_parent_dir(destination)
+    if isinstance(payload, (bytes, bytearray)):
+        destination.write_bytes(payload)
+    elif isinstance(payload, str):
+        destination.write_text(payload, encoding="utf-8")
+    elif hasattr(payload, "to_dict") and callable(getattr(payload, "to_dict")):
+        data = payload.to_dict()
+        destination.write_text(json.dumps(data, ensure_ascii=False, default=str), encoding="utf-8")
+    else:
+        destination.write_text(json.dumps(payload, ensure_ascii=False, default=str), encoding="utf-8")
+
+
+def _persist_task_result(result: TaskResult, worker_logger: StructuredLogger, task_id: str) -> None:
+    """Write task results to disk immediately to prevent worker memory growth."""
+    if not result.output_directory or not result.output_filename or result.is_final_output is None:
+        # Enforce contract so handlers always provide persistence hints.
+        raise ValueError(
+            "TaskResult must define output_directory, output_filename, and is_final_output for disk persistence."
+        )
+    root = Path(result.output_directory).expanduser()
+    file_component = Path(result.output_filename)
+    if file_component.is_absolute():
+        raise ValueError("output_filename must be a relative path.")
+    if result.is_final_output:
+        destination = root / file_component
+        _write_final_output(destination, result.payload)
+    else:
+        cache_dir = root / "cache"
+        # Intermediate artefacts must be CSV files under the cache directory.
+        destination = (cache_dir / file_component).with_suffix(".csv")
+        _write_csv_output(destination, result.payload)
+    resolved = destination.resolve()
+    meta_source = result.metadata or {}
+    meta = dict(meta_source)
+    final_flag = bool(result.is_final_output)
+    meta["written_path"] = str(resolved)
+    meta["is_final_output"] = final_flag
+    result.metadata = meta
+    result.written_path = str(resolved)
+    result.is_final_output = final_flag
+    result.payload = str(resolved)
+    worker_logger.debug(
+        "executor.worker.persisted",
+        task_id=task_id,
+        path=str(resolved),
+        final=result.is_final_output,
+    )
+
+
 def _worker_main(
     worker_id: int,
     task_queue: "mp.Queue[Optional[LeasedTask]]",
@@ -211,6 +298,7 @@ def _worker_main(
                     )
                     hb_thread.start()
                 result = _call_with_timeout(handler, leased, context, policy.task_timeout)
+                _persist_task_result(result, worker_logger, leased.task.task_id)
                 latency = time.time() - start
                 result_queue.put(("ack", leased, latency, result))
                 break
@@ -270,22 +358,6 @@ class ParallelExecutor:
         self._active_lock = threading.Lock()
         self._active_tasks = 0
         self._last_idle_log = 0.0
-        self._resource_monitor = get_default_resource_monitor()
-        self._dispatch_controller = AdaptiveDispatchController(
-            max_concurrency=policy.max_concurrency,
-            window_multiplier=policy.dispatch_window_multiplier,
-            initial_rate=policy.dispatch_token_initial_rate,
-            rate_capacity=policy.dispatch_token_capacity,
-            rate_min=policy.dispatch_token_min_rate,
-            rate_max=policy.dispatch_token_max_rate,
-            target_utilisation_low=policy.dispatch_target_low,
-            target_utilisation_high=policy.dispatch_target_high,
-            evaluation_interval=policy.dispatch_evaluation_interval,
-            ema_alpha=policy.dispatch_ema_alpha,
-            aimd_step=policy.dispatch_aimd_step,
-            aimd_decay=policy.dispatch_aimd_decay,
-            resource_monitor=self._resource_monitor,
-        )
         self._events.on_start(self)
         logger.info(
             "executor.start",
@@ -434,32 +506,18 @@ class ParallelExecutor:
                     self._log_dispatch_idle("prefetch_full", stats)
                     time.sleep(self._policy.idle_sleep)
                     continue
-                desired = min(self._policy.lease_batch_size, available_slots)
-                decision = self._dispatch_controller.compute_budget(
-                    active_tasks=self._active_tasks,
-                    queued=queue_size,
-                    available_slots=available_slots,
-                    desired=desired,
-                )
-                if decision.dispatch <= 0:
-                    stats = self._pool.stats()
-                    reason = decision.reason or "controller_block"
-                    self._log_dispatch_idle(reason, stats)
+                request = min(self._policy.lease_batch_size, available_slots)
+                if request <= 0:
                     time.sleep(self._policy.idle_sleep)
                     continue
-                request = decision.dispatch
                 leased = self._pool.lease(request, self._policy.lease_ttl, filters=self._policy.filters)
                 if not leased:
-                    self._dispatch_controller.refund(request)
                     stats = self._pool.stats()
                     self._log_dispatch_idle("no_visible_tasks", stats)
                     if stats.get("visible", 0) == 0 and self._active_tasks == 0:
                         break
                     time.sleep(self._policy.idle_sleep)
                     continue
-                if len(leased) < request:
-                    self._dispatch_controller.refund(request - len(leased))
-                self._dispatch_controller.on_dispatched(len(leased))
                 for idx, item in enumerate(leased):
                     if idx in (0, len(leased) // 2, len(leased) - 1):
                         logger.debug(
@@ -503,7 +561,6 @@ class ParallelExecutor:
                 processed = int(getattr(result, "processed", 0) or 0)
                 if processed <= 0:
                     processed = 1
-                self._dispatch_controller.on_completed(processed, latency=latency)
                 self._decrement_active()
             elif msg_type == "retry":
                 _, leased, attempt, error_text = message
@@ -523,7 +580,6 @@ class ParallelExecutor:
                 if not requeue:
                     self._pool.mark_dead(leased.task.task_id, str(error_text))
                     logger.error("executor.task_dead", task_id=leased.task.task_id, error=error_text, traceback=tb)
-                self._dispatch_controller.on_completed(1, latency=latency)
                 self._decrement_active()
             elif msg_type == "hb":
                 _, task_id = message

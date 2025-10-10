@@ -1,0 +1,44 @@
+[
+  {
+    "part_id": "part-001",
+    "group": "bracket",
+    "weight": 1.2,
+    "category": "structural",
+    "description": "Base bracket component"
+  },
+  {
+    "part_id": "part-002",
+    "group": "bracket",
+    "weight": 0.8,
+    "category": "structural",
+    "description": "Bracket variant with cutout"
+  },
+  {
+    "part_id": "part-003",
+    "group": "fastener",
+    "weight": 0.4,
+    "category": "hardware",
+    "description": "Metric screw M5"
+  },
+  {
+    "part_id": "part-004",
+    "group": "fastener",
+    "weight": 0.5,
+    "category": "hardware",
+    "description": "Metric screw M6"
+  },
+  {
+    "part_id": "part-005",
+    "group": "housing",
+    "weight": 2.6,
+    "category": "structural",
+    "description": "Motor housing shell"
+  },
+  {
+    "part_id": "part-006",
+    "group": "housing",
+    "weight": 1.9,
+    "category": "structural",
+    "description": "Protective cover"
+  }
+]

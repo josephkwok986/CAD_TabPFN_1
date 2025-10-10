@@ -86,7 +86,6 @@ class InMemoryBackend(TaskPoolBackend):
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._ready: List[Tuple[int, int, _TaskEntry]] = []
-        self._delayed: List[Tuple[float, int, _TaskEntry]] = []
         self._leased: Dict[str, _TaskEntry] = {}
         self._dead: Dict[str, _TaskEntry] = {}
         self._sequence = 0
@@ -95,7 +94,6 @@ class InMemoryBackend(TaskPoolBackend):
         logger.debug(
             event,
             ready=len(self._ready),
-            delayed=len(self._delayed),
             leased=len(self._leased),
             dead=len(self._dead),
         )
@@ -131,25 +129,14 @@ class InMemoryBackend(TaskPoolBackend):
         self._sequence += 1
         heapq.heappush(self._ready, (entry.priority, self._sequence, entry))
 
-    def _push_delayed(self, entry: _TaskEntry) -> None:
-        self._sequence += 1
-        heapq.heappush(self._delayed, (entry.visible_at, self._sequence, entry))
-
-    def _promote_ready(self, now: float) -> None:
-        while self._delayed and self._delayed[0][0] <= now:
-            _, _, entry = heapq.heappop(self._delayed)
-            self._push_ready(entry)
-
     def put(self, entries: Sequence[_TaskEntry]) -> None:
         with self._lock:
             now = time.time()
             for idx, entry in enumerate(entries):
                 if entry.expires_at is not None and entry.expires_at <= now:
                     continue
-                if entry.visible_at <= now:
-                    self._push_ready(entry)
-                else:
-                    self._push_delayed(entry)
+                entry.visible_at = now
+                self._push_ready(entry)
                 if idx in (0, len(entries) // 2, len(entries) - 1):
                     logger.info(
                         "task.put",
@@ -164,7 +151,6 @@ class InMemoryBackend(TaskPoolBackend):
         with self._lock:
             now = time.time()
             self._requeue_expired_locked(now)
-            self._promote_ready(now)
             if not self._ready:
                 return leased
             count = min(max_n, len(self._ready))
@@ -213,14 +199,17 @@ class InMemoryBackend(TaskPoolBackend):
             entry.last_reason = "nack"
             now = time.time()
             if requeue:
-                entry.visible_at = now + (delay or 0.0)
+                if delay and delay > 0:
+                    logger.warning(
+                        "task.nack.delay_ignored",
+                        task_id=task_id,
+                        requested_delay=delay,
+                    )
+                entry.visible_at = now
                 entry.lease_deadline = None
                 entry.lease_id = None
                 entry.retry_count += 1
-                if entry.visible_at <= now:
-                    self._push_ready(entry)
-                else:
-                    self._push_delayed(entry)
+                self._push_ready(entry)
                 logger.warning(
                     "task.nack.requeued",
                     task_id=task_id,
@@ -258,8 +247,6 @@ class InMemoryBackend(TaskPoolBackend):
 
     def stats(self) -> Mapping[str, Union[int, float]]:
         with self._lock:
-            now = time.time()
-            self._promote_ready(now)
             visible = len(self._ready)
             leased = len(self._leased)
             dead = len(self._dead)
@@ -276,22 +263,18 @@ class InMemoryBackend(TaskPoolBackend):
             now = time.time()
             all_entries = self._collect_entries()
             self._ready.clear()
-            self._delayed.clear()
             for entry in all_entries:
                 if predicate(entry.task):
                     drained.append(entry.task)
                 else:
-                    if entry.visible_at <= now:
-                        self._push_ready(entry)
-                    else:
-                        self._push_delayed(entry)
+                    entry.visible_at = now
+                    self._push_ready(entry)
             logger.info("task.drain", drained=len(drained))
         return drained
 
     def _collect_entries(self) -> List[_TaskEntry]:
         ready_entries = [entry for _, _, entry in self._ready]
-        delayed_entries = [entry for _, _, entry in self._delayed]
-        return ready_entries + delayed_entries
+        return ready_entries
 
     def snapshot_entries(self) -> List[_TaskEntry]:
         return self._collect_entries() + list(self._leased.values())
@@ -307,15 +290,6 @@ class InMemoryBackend(TaskPoolBackend):
             rebuilt_ready.append((priority, seq, entry))
         for item in rebuilt_ready:
             heapq.heappush(self._ready, item)
-        rebuilt_delayed: List[Tuple[float, int, _TaskEntry]] = []
-        while self._delayed:
-            visible_at, seq, entry = heapq.heappop(self._delayed)
-            if entry.task.task_id == task_id and found is None:
-                found = entry
-                continue
-            rebuilt_delayed.append((visible_at, seq, entry))
-        for item in rebuilt_delayed:
-            heapq.heappush(self._delayed, item)
         return found
 
 
@@ -332,6 +306,7 @@ class FileBackend(TaskPoolBackend):
         with self._path.open("r", encoding="utf-8") as fh:
             rows = [json.loads(line) for line in fh if line.strip()]
         entries: List[_TaskEntry] = []
+        now = time.time()
         for row in rows:
             task_data = dict(row["task"])
             task_data["payload_ref"] = tuple(task_data.get("payload_ref", []))
@@ -340,7 +315,7 @@ class FileBackend(TaskPoolBackend):
             entry = _TaskEntry(
                 task=record,
                 priority=row["priority"],
-                visible_at=row["visible_at"],
+                visible_at=now,
                 expires_at=row.get("expires_at"),
                 lease_deadline=None,
                 lease_id=None,

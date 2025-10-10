@@ -95,18 +95,15 @@ _STANDARD_FIELDS = {
     "span_id",
     "corr_id",
     "job_id",
-    "task_id",
     "attempt",
     "latency_ms",
     "msg",
     "event",
     "ts",
-    "ts_local",
     "logger",
     "file",
     "level",
     "extras",
-    "stage",
 }
 
 _SECRET_PATTERNS = (
@@ -118,19 +115,8 @@ _SECRET_PATTERNS = (
     "pwd",
 )
 
-_DEFAULT_STAGE = "Discovery"
-
-
 def _utcnow() -> _dt.datetime:
     return _dt.datetime.now(tz.tzutc())
-
-
-def _isoformat(dt: _dt.datetime) -> str:
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=tz.tzutc())
-    return dt.astimezone(tz.tzutc()).isoformat().replace("+00:00", "Z")
-
-
 def _safe_summary(value: Any, *, max_length: int = 16384) -> Any:
     """Return a representation safe for JSON serialisation."""
     if value is None or isinstance(value, (bool, int, float)):
@@ -545,18 +531,6 @@ class StructuredLogger:
             current.pop(key, None)
         self._context.set(current)
 
-    @contextlib.contextmanager
-    def stage(self, stage: str) -> Iterator[None]:
-        previous = dict(self._context.get()).get("stage")
-        self.bind(stage=stage)
-        try:
-            yield
-        finally:
-            if previous is None:
-                self.unbind("stage")
-            else:
-                self.bind(stage=previous)
-
     # Logging -------------------------------------------------------
     def debug(self, event: str, **fields: Any) -> bool:
         return self._log("DEBUG", event, fields)
@@ -593,42 +567,33 @@ class StructuredLogger:
 
     def _make_record(self, level: str, event: str, fields: Dict[str, Any]) -> Dict[str, Any]:
         now = _utcnow()
+        offset = tz.gettz("Asia/Shanghai")
+        if offset is None:
+            offset = _dt.timezone(_dt.timedelta(hours=8))
+        ts_value = now.astimezone(offset).isoformat()
         frame_info = self._caller_frame()
         context = self._context.get()
         combined: Dict[str, Any] = {**context, **fields}
         redacted = _MANAGER.redactor.redact_mapping(dict(combined))
         record: Dict[str, Any] = {
-            "ts": _isoformat(now),
-            "ts_local": now.astimezone(_MANAGER.render_tz).isoformat(),
+            "ts": ts_value,
             "level": level,
             "event": event,
-            "logger": self.name,
             "file": f"{frame_info.filename}:{frame_info.lineno}",
         }
-        # Extract known keys
         for key in [
             "trace_id",
             "span_id",
             "corr_id",
             "job_id",
-            "task_id",
             "attempt",
             "latency_ms",
             "msg",
-            "stage",
         ]:
             if key in redacted:
                 record[key] = redacted.pop(key)
-        stage_value = record.get("stage")
-        if not (isinstance(stage_value, str) and stage_value.strip()):
-            candidate = combined.get("stage")
-            if isinstance(candidate, str) and candidate.strip():
-                stage_value = candidate.strip()
-            elif candidate is not None and str(candidate).strip():
-                stage_value = str(candidate).strip()
-            else:
-                stage_value = _DEFAULT_STAGE
-        record["stage"] = stage_value
+        redacted.pop("task_id", None)
+        redacted.pop("stage", None)
         extras = {k: v for k, v in redacted.items() if k not in _STANDARD_FIELDS}
         record["extras"] = extras or None
         return record
@@ -646,9 +611,36 @@ class StructuredLogger:
 
     @staticmethod
     def _serialize(record: Dict[str, Any]) -> str:
-        if _orjson is not None:
-            return _orjson.dumps(record).decode("utf-8")
-        return json.dumps(record, separators=(",", ":"), ensure_ascii=False)
+        def _stringify(value: Any) -> str:
+            if isinstance(value, (dict, list, tuple)):
+                return json.dumps(value, ensure_ascii=False)
+            return str(value)
+
+        segments: List[str] = []
+
+        def append(field: Optional[str], val: Any) -> None:
+            if val is None or val == "":
+                return
+            rendered = _stringify(val)
+            if field is None:
+                segments.append(rendered)
+            else:
+                segments.append(f"{field}={rendered}")
+
+        append(None, record.get("ts"))
+        append(None, record.get("file"))
+        append(None, record.get("level"))
+        append("event", record.get("event"))
+        for key in ["trace_id", "span_id", "corr_id", "job_id", "attempt", "latency_ms", "msg"]:
+            if key in record:
+                append(key, record.get(key))
+
+        extras = record.get("extras") or {}
+        if isinstance(extras, dict):
+            for key, value in extras.items():
+                append(key, value)
+
+        return "|".join(segments)
 
     # Utilities -----------------------------------------------------
     @staticmethod
