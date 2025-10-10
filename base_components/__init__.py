@@ -15,6 +15,7 @@ from .task_partitioner import (
 from .task_pool import TaskPool, LeasedTask
 from .task_system_config import ensure_task_config, get_executor_value, get_pool_value, get_task_value
 from .gpu_resources import GPUDevice, GPUResourceManager
+from .progress import ProgressController, ProgressProxy
 
 __all__ = [
     "Config",
@@ -38,4 +39,6 @@ __all__ = [
     "get_task_value",
     "GPUDevice",
     "GPUResourceManager",
+    "ProgressController",
+    "ProgressProxy",
 ]

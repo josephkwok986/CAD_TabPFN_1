@@ -15,6 +15,7 @@ from base_components import (
     ExecutorPolicy,
     Plan,
     ParallelExecutor,
+    ProgressController,
     StructuredLogger,
     TaskPartitioner,
     TaskPool,
@@ -115,6 +116,10 @@ def task_handler(leased: LeasedTask, context: Dict[str, Any]) -> TaskResult:
         }
         for item in task_items
     ]
+
+    progress_proxy = context.get("progress")
+    if progress_proxy is not None:
+        progress_proxy.advance(len(task_items))
 
     return TaskResult(
         payload=csv_rows,
@@ -228,29 +233,32 @@ def main() -> None:
             output=result.written_path,
         )
 
-    context = {
-        "items_map": items_by_ref,
-        "output_root": output_root,
-    }  # handler 运行所需的共享上下文。
-
     prefer_fork_context()
     policy = ExecutorPolicy()  # 从配置加载执行策略。
-    try:
-        # 优先尝试使用多进程执行器从任务池中并行消费任务。
-        ParallelExecutor.run(
-            handler=task_handler,
-            pool=pool,
-            policy=policy,
-            handler_context=context,
-            result_handler=on_result,
-            console_min_level="INFO",
-        )
-    except PermissionError as exc:
-        logger.warning("example.parallel_unavailable", error=str(exc))
-        run_sequential_executor(pool, task_handler, context, on_result, policy, logger)
-    except OSError as exc:  # pragma: no cover - defensive fallback
-        logger.warning("example.parallel_oserror", error=str(exc))
-        run_sequential_executor(pool, task_handler, context, on_result, policy, logger)
+
+    with ProgressController(total_units=len(planner_items), description="处理示例零件") as progress:
+        context = {
+            "items_map": items_by_ref,
+            "output_root": output_root,
+            "progress": progress.make_proxy(),
+        }  # handler 运行所需的共享上下文。
+
+        try:
+            # 优先尝试使用多进程执行器从任务池中并行消费任务。
+            ParallelExecutor.run(
+                handler=task_handler,
+                pool=pool,
+                policy=policy,
+                handler_context=context,
+                result_handler=on_result,
+                console_min_level="INFO",
+            )
+        except PermissionError as exc:
+            logger.warning("example.parallel_unavailable", error=str(exc))
+            run_sequential_executor(pool, task_handler, context, on_result, policy, logger)
+        except OSError as exc:  # pragma: no cover - defensive fallback
+            logger.warning("example.parallel_oserror", error=str(exc))
+            run_sequential_executor(pool, task_handler, context, on_result, policy, logger)
 
     logger.info("example.executor_done", active=len(collected_metadata))
     logger.info("example.pool_after", stats=dict(pool.stats()))

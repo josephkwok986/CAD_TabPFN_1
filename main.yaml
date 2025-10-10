@@ -1,264 +1,116 @@
-# 配置主版本号，用于整体格式的兼容性校验
+# 顶层配置版本号
 version: 1
-# 关于配置本身的元信息
+# 配置元信息
 config:
-  # 配置结构的内部版本号，便于迁移脚本判断
+  # 配置架构版本
   version: 1
-# 应用进程级别的基础配置
-app:
-  # 服务名称，用于日志、指标和监控标识
-  name: my-service
-  # 当前部署环境标识，可影响行为或日志输出
-  env: dev
-  # 持久化时间戳时使用的时区
-  tz_store: UTC
-  # 向用户展示时间时使用的时区
-  tz_render: Europe/London
-# 进程运行时的默认参数
-runtime:
-  # 运行时默认时区，未指定时采用此值
-  tz: UTC
-# 输入输出及文件系统相关配置
-io:
-  # 运行时临时文件的根目录
-  root: /var/run/app
-  # IO 操作失败时的最大重试次数
-  retry: 3
-# 全局限流与并发控制
-limits:
-  # 每秒允许的最大操作次数
-  rate: 100
-  # 允许同时处理的最大并发请求数
-  concurrency: 16
-# 数据库连接配置
-db:
-  # 数据库主机地址
-  host: 127.0.0.1
-  # 数据库端口号
-  port: 5432
-# 机密信息来源配置
-secrets:
-  # 数据库密码从环境变量 DB_PASS 中读取
-  db_password: env:DB_PASS
-# 结构化日志系统的配置
+# 日志系统配置
 logger:
-  # 默认日志等级
+  # 默认日志级别
   level: INFO
-  # 日志命名空间前缀
-  namespace: cad.tabpfn
-  # 日志中时间的显示时区配置
-  timezone:
-    # 渲染日志时间戳时使用的时区
-    render: Europe/London
-  # 日志输出目的地列表
+  # 日志命名空间
+  namespace: cad.pipeline
+  # 输出目标列表
   sinks:
-    # 控制台输出配置
-    - type: console
-      # 选择输出到 stdout
+    - # 控制台输出通道
+      type: console
+      # 流类型
       stream: stdout
-      # 控制台仅输出 WARN 及以上级别
-      min_level: WARN
-    # 滚动文件输出配置
-    - type: rotating_file
-      # 日志文件路径
-      path: logs/app.log
-      # 单个文件的最大大小（字节）
-      max_bytes: 10485760
-      # 保留的历史文件数量
-      backups: 5
-  # 日志采样控制，避免过量输出
-  sampling:
-    # 没有命中规则时的默认采样比例
-    default_rate: 1.0
-    # 采样随机数种子，确保可复现
-    seed: 42
-    # 针对特定级别或事件的采样规则
-    rules:
-      # 针对 DEBUG 日志的采样策略
-      - level: DEBUG
-        # 保留日志的概率
-        rate: 0.1
-        # 在指定时间窗口内允许的最大突发次数
-        burst: 5
-        # 突发窗口时长（秒）
-        interval: 60
-  # 日志字段脱敏策略
-  redact:
-    # 明确允许保留的字段名
-    allow:
-      - trace_id
-      - span_id
-      - corr_id
-    # 字段名中包含以下关键词时会被掩码
-    deny_patterns:
-      - password
-      - secret
-      - token
-      - key
-      - credential
-      - pwd
-# 任务系统相关配置，供管线执行器使用
+      # 最低输出级别
+      min_level: INFO
+# 任务系统参数
 task_system:
-  # 任务池配置
+  # 任务池设置
   pool:
-    # 任务租约的默认超时时间（秒）
-    default_ttl: 120.0
-    # 使用的任务池后端类型
+    # 默认租约持续时间（秒）
+    default_ttl: 30.0
+    # 任务池后端
     backend:
-      # 采用内存实现的任务队列
+      # 后端类型
       type: memory
-  # 并行执行器配置
+  # 执行器策略
   executor:
-    # 允许同时运行的最大工作进程数
-    max_concurrency: 12
-    # 每次从任务池租借的任务数
-    lease_batch_size: 10
-    # 单个任务租约的有效时长（秒）
-    lease_ttl: 30.0
-    # 预取任务的目标数量，用于保持任务队列充足
-    prefetch: 20
-    # 无任务可取时的睡眠时间（秒）
-    idle_sleep: 0.5
-    # 单个任务允许的最大重试次数
-    max_retries: 2
-    # 重试时指数退避的基础延迟（秒）
-    backoff_base: 0.5
-    # 退避延迟附加的随机抖动（秒）
-    backoff_jitter: 0.3
-    # 任务最长执行时间，null 表示不限
+    # 最大并发 worker 数
+    max_concurrency: 4
+    # 每次租借任务数
+    lease_batch_size: 4
+    # 租约时长（秒）
+    lease_ttl: 10.0
+    # 预取队列长度
+    prefetch: 8
+    # 空闲等待时间（秒）
+    idle_sleep: 0.1
+    # 最大重试次数
+    max_retries: 1
+    # 退避基准秒数
+    backoff_base: 0.2
+    # 退避抖动幅度
+    backoff_jitter: 0.1
+    # 任务超时阈值（秒，null 表示不限）
     task_timeout: null
-    # 任务失败后重新入队前的延迟，null 表示立即
+    # 失败后延时重试（秒，null 表示默认）
     failure_delay: null
-    # 任务租借时的附加过滤条件
+    # 任务过滤器
     filters: {}
-    # 任务失败时是否重新入队
+    # 失败任务是否重新入队
     requeue_on_failure: true
-    # 首选的 GPU 索引列表，决定 worker 绑定的显卡
-    preferred_gpus: [0]
-    # 心跳间隔（秒），null 表示按 lease_ttl 自动计算
+    # 指定优先 GPU 列表
+    preferred_gpus: []
+    # 心跳间隔（秒，null 表示自动）
     heartbeat_interval: null
-
-# 业务管线配置集合
-pipelines:
-  # S2 去重与族群聚类管线的配置
-  s2:
-    # 要扫描的 CAD 数据源列表
-    sources:
-      # MFInstSeg 数据集
-      - dataset: MFInstSeg
-        # 数据集所属层级，用于隔离策略
-        tier: gold
-        # 数据集在文件系统中的根目录
-        root: "/workspace/Gjj Local/data/CAD/CAD_data/MFInstSeg"
-        # 发现阶段使用的文件匹配模式
-        pattern: "**/*"
-        # 允许处理的文件扩展名
-        allowed_extensions: [".step", ".stp", ".stpz", ".brep", ".brp"]
-      # MFCAD 数据集
-      - dataset: MFCAD
-        # 数据集所属层级
-        tier: silver
-        # 数据集根目录
-        root: "/workspace/Gjj Local/data/CAD/CAD_data/MFCAD"
-        # 文件匹配模式
-        pattern: "**/*"
-        # 允许的文件扩展名
-        allowed_extensions: [".step", ".stp", ".stpz", ".brep", ".brp"]
-      # MFCAD2 数据集
-      - dataset: MFCAD2
-        # 数据集所属层级
-        tier: silver
-        # 数据集根目录
-        root: "/workspace/Gjj Local/data/CAD/CAD_data/MFCAD2"
-        # 文件匹配模式
-        pattern: "**/*"
-        # 允许的文件扩展名
-        allowed_extensions: [".step", ".stp", ".stpz", ".brep", ".brp"]
-    # 发现阶段的抽样配置
-    sampling:
-      # 若设置为整数，则最多保留指定数量的零件
-      subset_n: null
-      # 若设置为小数，则按比例保留零件
-      subset_frac: null
-      # 对每个候选零件进行保留的概率（0~1）
-      probability: 1
-      # 抽样的随机种子，确保多次运行结果一致
-      seed: 42
-    # 特征提取阶段参数
-    features:
-      # 生成的描述符向量维度
-      descriptor_length: 64
-      # 几何采样点数量
-      sample_points: 4096
-      # 描述符生成的随机种子
-      random_seed: 1337
-    # 去重策略参数
-    dedup:
-      # 判定两个零件为重复的余弦相似度阈值
-      similarity_threshold: 0.995
-      # 边界盒比例的容差，用于几何重复判断
-      bbox_tolerance: 0.02
-    # 聚类与族群划分配置
-    clustering:
-      # 使用的聚类算法
-      method: dbscan
-      # DBSCAN 的基础半径参数
-      eps: 0.012
-      # 聚类形成所需的最小点数
-      min_samples: 6
-      # 构建 FAISS kNN 图时使用的 k
-      knn_k: 96
-      # 自动估计 eps 的相关设置
-      auto_eps:
-        # 是否启用自动估计
-        enabled: true
-        # 估计时使用的距离分位数
-        quantile: 0.12
-        # 参与估计的最大样本数量
-        sample_size: 20000
-        # 在估计值基础上乘以的缩放因子
-        scale: 1.02
-    # 任务拆分策略配置
+# 任务切分默认配置
+task_partitioner:
+  # 默认约束参数
+  defaults:
+    # 每个任务最大条目数
+    max_items_per_task: 12
+    # 切分洗牌种子
+    shuffle_seed: 42
+# S2 阶段配置
+s2:
+  # S2.1 几何签名提取
+  signature:
+    # 原始 CAD 数据根目录
+    raw_root: "/workspace/Gjj Local/data/CAD/CAD_data"
+    # S2 输出根目录
+    out_root: "/workspace/Gjj Local/data/CAD/step_out/s2_out"
+    # 每个零件采样点数量
+    sample_points: 4096
+    # 固定样本数量（null 表示不限）
+    subset_n: null
+    # 样本抽样比例（null 表示不限）
+    subset_frac: null
+    # D2 描述子计算设备偏好
+    device: auto
+    # 是否生成 OCC 演示数据
+    demo_occ: false
+    # 任务切分策略
     partition:
-      # 任务划分策略（weighted 表示按权重平衡）
+      # 切分策略名称
       strategy: weighted
-      # 附加的拆分约束
-      constraints:
-        # 单个执行任务中允许的最大零件数
-        max_items_per_task: 8
-        # 拆分时的洗牌种子，保证顺序可复现
-        shuffle_seed: 42
-    # 各阶段结果的磁盘缓存开关
-    stage_cache:
-      # 是否缓存发现阶段的候选零件列表
-      discovery: true
-      # 是否缓存任务规划结果
-      plan: false
-      # 是否缓存执行阶段生成的特征记录
-      execution: true
-      # 是否缓存 DataFrame 构建结果
-      dataframe: false
-      # 是否缓存富集后的 DataFrame
-      enrichment: true
-    # 输出结果的路径与开关
-    outputs:
-      # 输出文件存放的根目录
-      root: "/workspace/Gjj Local/data/CAD/step_out/s2_out"
-      # 描述符签名数据的 Parquet 文件名
-      signatures_file: signatures.parquet
-      # 全量零件索引的 CSV 文件名
-      part_index_file: part_index.csv
-      # 数据集切分辅助索引的 CSV 文件名
-      part_index_for_split_file: part_index.for_split.csv
-      # 家族统计信息的 CSV 文件名
-      family_hist_file: family_hist.csv
-      # 诊断信息的 JSON 文件名
-      diagnostics_file: diagnostics.json
-      # 是否写出签名 Parquet 文件
-      write_signatures: true
-    # 跨层级重复的隔离策略
-    quarantine:
-      # 案例冲突时优先保留的层级
-      preferred_tier: gold
-      # 被隔离零件记录的原因描述
-      reason: cross_tier_duplicate
+      # 分组字段
+      group_by: source_dataset
+      # 单任务最大条目数
+      max_items_per_task: 12
+      # 任务数量上限（null 表示自动）
+      max_tasks: null
+      # 切分洗牌种子
+      shuffle_seed: 42
+  # S2.2 去重聚类
+  dedup:
+    # S2 输出根目录（复用 S2.1 输出）
+    out_root: "/workspace/Gjj Local/data/CAD/step_out/s2_out"
+    # FAISS 计算设备偏好
+    device: gpu
+    # D2 相似度阈值
+    d2_sim_threshold: 0.995
+    # 包围盒容差阈值
+    bbox_tol: 0.02
+    # 特征归一化策略
+    feature_norm:
+      # 是否对每个块做 L2 归一化
+      block_l2: true
+      # 是否对拼接后的向量再做 L2 归一化
+      global_l2: true
+      # 块权重模式
+      block_weight: equal
