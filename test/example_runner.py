@@ -6,21 +6,26 @@ from __future__ import annotations
 import csv
 import json
 import os
+import shutil
 import multiprocessing as mp
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
 from base_components import (
     Config,
     ExecutorPolicy,
-    Plan,
     ParallelExecutor,
     ProgressController,
     StructuredLogger,
     TaskPartitioner,
-    TaskPool,
     TaskResult,
     ensure_task_config,
+)
+# 使示例覆盖文件队列与任务池核心接口
+from base_components import (
+    PartitionConstraints,
+    PartitionStrategy,
+    TaskPool,
 )
 from base_components.gpu_resources import GPUResourceManager
 from base_components.parallel_executor import _persist_task_result
@@ -41,8 +46,8 @@ def load_items(raw_path: Path) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str
             {
                 "payload_ref": payload_ref,
                 "weight": float(entry["weight"]),
-                "group_key": entry["group"],
                 "metadata": {
+                    "group": entry["group"],
                     "category": entry["category"],
                     "description": entry["description"],
                 },
@@ -53,29 +58,30 @@ def load_items(raw_path: Path) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str
     return planner_items, items_by_ref
 
 
-def build_plan(items: Iterable[Dict[str, Any]]) -> Plan:
-    """使用权重策略创建任务规划，并限制每个任务的体积。"""
-    constraints = {
-        "group_by": "group",  # 按零件类别分组，避免跨类别混合。
-        "max_items_per_task": 2,  # 控制单个任务的最大条目数。
-        "shuffle_seed": 7,  # 固定洗牌种子，保证示例结果可复现。
-    }
-    plan = TaskPartitioner.plan(
-        {"job_id": "demo-job"},
-        items,
-        strategy="weighted",
-        constraints=constraints,
-        metadata={"description": "example_runner partition"},
-    )
-    plan.ensure_valid()
-    return plan
+def _compute_gini(weights: List[float]) -> float:
+    filtered = [w for w in weights if w >= 0]
+    if not filtered:
+        return 0.0
+    sorted_vals = sorted(filtered)
+    total = sum(sorted_vals)
+    n = len(sorted_vals)
+    if total == 0 or n == 0:
+        return 0.0
+    cum = 0.0
+    for idx, value in enumerate(sorted_vals, 1):
+        cum += idx * value
+    return (2 * cum) / (n * total) - (n + 1) / n
 
 
 def ensure_output_root(base_dir: Path) -> Path:
     """创建输出目录及缓存子目录，保持示例的文件布局。"""
     output_root = base_dir / "output"  # 所有输出结果的根路径。
     cache_dir = output_root / "cache"  # worker 写入中间 CSV 的约定位置。
+    queue_dir = output_root / "queue"
     cache_dir.mkdir(parents=True, exist_ok=True)
+    if queue_dir.exists():
+        shutil.rmtree(queue_dir)
+    queue_dir.mkdir(parents=True, exist_ok=True)
     return output_root
 
 
@@ -87,26 +93,6 @@ def bootstrap_config(base_dir: Path) -> Config:
     os.environ["CAD_TASK_CONFIG"] = str(config_path)
     Config.set_singleton(None)
     return Config.load_singleton(config_path)
-
-
-def prefer_fork_context() -> None:
-    """在支持的环境下优先使用 fork 上下文，避免 spawn 受限。"""
-    if getattr(prefer_fork_context, "_patched", False):
-        return
-
-    original_get_context = mp.get_context
-
-    def _patched_get_context(method: str | None = None):
-        target = method
-        if method == "spawn":
-            try:
-                return original_get_context("fork")
-            except ValueError:
-                target = method
-        return original_get_context(target)
-
-    mp.get_context = _patched_get_context  # type: ignore[assignment]
-    prefer_fork_context._patched = True  # type: ignore[attr-defined]
 
 
 def task_handler(leased: LeasedTask, context: Dict[str, Any]) -> TaskResult:
@@ -136,7 +122,6 @@ def task_handler(leased: LeasedTask, context: Dict[str, Any]) -> TaskResult:
         processed=len(task_items),
         metadata={
             "task_id": leased.task.task_id,
-            "group_keys": list(leased.task.group_keys),
             "total_weight": total_weight,
         },
         output_directory=str(output_root),
@@ -216,17 +201,38 @@ def main() -> None:
     logger.info("example.start", base_dir=str(base_dir))
 
     planner_items, items_by_ref = load_items(base_dir / "sample_items.json")  # 解析样例零件。
-    plan = build_plan(planner_items)  # 生成任务规划。
+    queue_root = output_root / "queue"
+    job_spec = {"job_id": "demo-job"}
+    constraints = PartitionConstraints(max_items_per_task=2)
+    strategy = PartitionStrategy.FIXED
+
+    manifest_path = queue_root / "manifest.jsonl"
+    pool = TaskPool(queue_root=queue_root, queue_name="default")
+    weights: List[float] = []
+    task_count = 0
+    with manifest_path.open("w", encoding="utf-8") as manifest:
+        for task in TaskPartitioner.iter_tasks(job_spec, planner_items, strategy, constraints=constraints):
+            pool.put(task)
+            manifest.write(json.dumps({"task_id": task.task_id, "payload_ref": list(task.payload_ref)}) + "\n")
+            weights.append(task.weight)
+            task_count += 1
+
     logger.info(
         "example.plan",
-        job_id=plan.job_spec["job_id"],
-        tasks=plan.statistics.task_count,
-        total_weight=plan.statistics.total_weight,
+        job_id=job_spec["job_id"],
+        tasks=task_count,
+        total_weight=sum(weights),
+        gini=_compute_gini(weights),
     )
 
-    pool = TaskPool()  # 任务池默认使用内存后端，适合示例。
-    pool.put(plan.tasks)
-    logger.info("example.pool", stats=dict(pool.stats()))
+    logger.info(
+        "example.queue_ready",
+        directory=str(queue_root),
+        manifest=str(manifest_path),
+        records=task_count,
+    )
+
+    logger.info("example.pool_ready", stats=dict(pool.stats()))
 
     gpu_manager = GPUResourceManager.discover(preferred=None)  # 演示 GPU 探针能力。
     logger.info("example.gpu", device_count=gpu_manager.available())
@@ -242,7 +248,10 @@ def main() -> None:
             output=result.written_path,
         )
 
-    prefer_fork_context()
+    try:
+        mp.set_start_method("spawn")
+    except RuntimeError:
+        pass
     policy = ExecutorPolicy()  # 从配置加载执行策略。
 
     with ProgressController(total_units=len(planner_items), description="处理示例零件") as progress:

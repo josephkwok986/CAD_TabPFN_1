@@ -1,3 +1,3 @@
-"""Runtime utilities package."""
+"""Runtime utilities placeholder."""
 
-__all__ = []
+__all__: tuple[str, ...] = ()

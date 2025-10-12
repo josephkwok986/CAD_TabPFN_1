@@ -5,7 +5,7 @@ docker run -it -v "/mnt/c/Users/GJJ/":/workspace -v "/mnt/c/Users/GJJ/Gjj Doc/Co
 docker exec -it tc bash -c "cd /workspace/'Gjj Doc'/Code && exec /bin/bash"
 
 
-python app/s2/s2.1_signature_pipeline.py --config main.yaml
+
 
 
 
@@ -15,9 +15,11 @@ python app/s2/s2.1_signature_pipeline.py --config main.yaml
 2. S2.1 前面阶段划分任务耗时太久了吗？为什么会花很长时间才真正开始执行任务呢？
 
 
-
+python app/s2/s2.1_signature_pipeline.py --config main.yaml
 pkill -9 -f "python app/s2/s2.1_signature_pipeline.py --config main.yaml"
 ps -ef | grep -v grep | grep "python -m app.s2.pipeline"
 
+clean.py --dry-run
+python3 clean.py -y
 
 codex "$(cat prompt.txt)"

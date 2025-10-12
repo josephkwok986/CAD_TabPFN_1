@@ -622,4 +622,80 @@
 【修改 example_runner.py，使其能正确执行】
 【后续所有回答都使用中文】
 
+
+
+【删除多任务并发中 group_by 相关代码逻辑】
+【在多任务并发的设计中尽量使用 spawn 】
+【任务池不再使用“内存队列+落盘快照”，而是使用file_queue.py实现】
+【计划“边产出边落盘”现在会先规范化全部条目、分组、再一次性构建所有任务对象。改为：逐组生成任务，立即写入外存队列，不把完整任务列表常驻内存。】
+【发现与加权估计流式化文件发现与权重估计不一次性构成完整列表，而是生成器分块产出，直接喂给分组/规划器；规划器只保留活动窗口，不保留“所有标准化条目”的大列表。现实现会构造完整规范化列表和分组，可重构为迭代式。】
+
+修改 example_runner.py:
+1.需要使用 base_components 所有组件的核心主流程接口都要用上
+2.使其正确执行。
+
+【task_pool.py 不再基于 内存，而是使用 file_queue.py实现，基于文件系统】
+【并发任务执行器，应该在初始化完成后就一直监视 task_pool.py 任务池，如有任务立刻分配任务给 worker 执行】
+【task_partitioner.py 不再使用 Plan 生成整个任务清单，而是逐步生成任务，生成任务后立刻放入 task_pool.py（该任务池现在应该使用 file_queue.py实现，会落盘）】
+
+【task_partitioner.py 不再生成完整 Plan，这部分代码不再保留。而是只用 iter_tasks 逐步产出任务（按约束触发批次刷新），调用方可对每个任务立即调用任务池的 put 入队】
+检查 example_runner.py 是否符合如下要求，如不符合，修改到符合未知:
+1.需要使用 base_components 所有组件的核心主流程接口都要用上
+2.使其正确执行。
+
+
+(tabpfn_cad) root@534bf1a5e9b0:/workspace/Gjj Doc/Code/CAD_TabPFN_1# python app/s2/s2.1_signature_pipeline.py --config main.yaml
+Traceback (most recent call last):
+  File "/workspace/Gjj Doc/Code/CAD_TabPFN_1/app/s2/s2.1_signature_pipeline.py", line 1038, in <module>
+    main()
+  File "/workspace/Gjj Doc/Code/CAD_TabPFN_1/app/s2/s2.1_signature_pipeline.py", line 1034, in main
+    runner.run()
+  File "/workspace/Gjj Doc/Code/CAD_TabPFN_1/app/s2/s2.1_signature_pipeline.py", line 941, in run
+    max_weight_per_task=sig_cfg.partition.max_weight_per_task,
+AttributeError: 'PartitionConfig' object has no attribute 'max_weight_per_task'. Did you mean: 'max_items_per_task'?
+出错了，修复一下。再检查一下 s2.1_signature_pipeline.py 有没有其他问题。
+
+
+执行python app/s2/s2.1_signature_pipeline.py --config main.yaml时：
+【2025-10-12T15:57:00.948607+08:00|/workspace/Gjj Doc/Code/CAD_TabPFN_1/base_components/parallel_executor.py:556|WARN|event=executor.ack_failed 出现很多这种日志，会影响执行结果吗？为什么会出现这个。你有需要可以看看相关日志。】
+【Exception in thread executor-dispatch:
+Traceback (most recent call last):
+  File "/workspace/Gjj Doc/Code/CAD_TabPFN_1/base_components/parallel_executor.py", line 514, in _dispatch_loop
+    leased = self._pool.lease(request, self._policy.lease_ttl, filters=self._policy.filters)
+  File "/workspace/Gjj Doc/Code/CAD_TabPFN_1/base_components/task_pool.py", line 111, in lease
+    task = self._decode_task(lease.payload)
+  File "/workspace/Gjj Doc/Code/CAD_TabPFN_1/base_components/task_pool.py", line 177, in _decode_task
+    data = json.loads(payload.decode("utf-8"))
+UnicodeDecodeError: 'utf-8' codec can't decode byte 0xfe in position 66550: invalid start byte
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/root/miniconda3/envs/tabpfn_cad/lib/python3.10/threading.py", line 1016, in _bootstrap_inner
+    self.run()
+  File "/root/miniconda3/envs/tabpfn_cad/lib/python3.10/threading.py", line 953, in run
+    self._target(*self._args, **self._kwargs)
+  File "/workspace/Gjj Doc/Code/CAD_TabPFN_1/base_components/parallel_executor.py", line 535, in _dispatch_loop
+    logger.exception("executor.dispatch.error", error=str(exc))
+TypeError: StructuredLogger.exception() missing 1 required positional argument: 'exc'
+执行过程中出现上述异常，但又能继续执行，会影响执行结果吗？为什么会出现这个】
+【"/workspace/Gjj Local/data/CAD/step_out/s2_out" 是s2.1_signature配置的输出目录，但查看该目录，好像是输到 cache 目录里？这是程序正常执行的结果吗？另外再抽查一下该输出目录相关的输出，是否符合预期】
+
+【"gpu_available": {
+    "cupy": false
+  } 这个是指GPU不能用吗？需要使用什么库？我自己先检查一下，这个先不要修改什么代码】
+【"/workspace/Gjj Local/data/CAD/step_out/s2_out/summary_s2_1.json"里，"num_failed": 67840，好像全部都失败了，修复该问题】
+【"/workspace/Gjj Local/data/CAD/step_out/s2_out/signatures.csv" 文件只有表头没有数据，修复该问题】
+
+
+【我试过 python -c "import cupy" 是可以的，为什么cupy还是false呢？】
+
+
+【2025-10-12T16:51:12.749027+08:00|/workspace/Gjj Doc/Code/CAD_TabPFN_1/base_components/task_pool.py:114|ERROR|event=task_pool.decode_failed|rec_id=2484579619424960512|error='utf-8' codec can't decode byte 0xfe in position 66550: invalid start byte
+出现一次这个错误，会影响执行结果吗？】
+【2025-10-12T17:03:46.987730+08:00|/workspace/Gjj Doc/Code/CAD_TabPFN_1/base_components/parallel_executor.py:556|WARN|event=executor.ack_failed
+这种日志，会失败后继承重试吧？应该不影响最终执行结果吧？如果重试多次最终还是失败，会打印ERROR日志吗？】
+
+【executor.ack_failed 这种完全不影响结果的，改为打debug级别的日志】
+
 EOF

@@ -358,6 +358,7 @@ class ParallelExecutor:
         self._active_lock = threading.Lock()
         self._active_tasks = 0
         self._last_idle_log = 0.0
+        self._idle_sleep = max(0.01, min(self._policy.idle_sleep, 0.05))
         self._events.on_start(self)
         logger.info(
             "executor.start",
@@ -504,11 +505,11 @@ class ParallelExecutor:
                 if available_slots <= 0:
                     stats = self._pool.stats()
                     self._log_dispatch_idle("prefetch_full", stats)
-                    time.sleep(self._policy.idle_sleep)
+                    time.sleep(self._idle_sleep)
                     continue
                 request = min(self._policy.lease_batch_size, available_slots)
                 if request <= 0:
-                    time.sleep(self._policy.idle_sleep)
+                    time.sleep(self._idle_sleep)
                     continue
                 leased = self._pool.lease(request, self._policy.lease_ttl, filters=self._policy.filters)
                 if not leased:
@@ -516,7 +517,7 @@ class ParallelExecutor:
                     self._log_dispatch_idle("no_visible_tasks", stats)
                     if stats.get("visible", 0) == 0 and self._active_tasks == 0:
                         break
-                    time.sleep(self._policy.idle_sleep)
+                    time.sleep(self._idle_sleep)
                     continue
                 for idx, item in enumerate(leased):
                     if idx in (0, len(leased) // 2, len(leased) - 1):
@@ -531,7 +532,7 @@ class ParallelExecutor:
                     self._increment_active()
             logger.info("executor.dispatch.complete")
         except Exception as exc:  # pragma: no cover - defensive logging
-            logger.exception("executor.dispatch.error", error=str(exc))
+            logger.exception("executor.dispatch.error", exc, error=str(exc))
             self._record_fatal(RuntimeError(f"Dispatch loop failed: {exc}"))
         finally:
             self._dispatch_done.set()
@@ -552,7 +553,7 @@ class ParallelExecutor:
                 _, leased, latency, result = message
                 success = self._pool.ack(leased.task.task_id)
                 if not success:
-                    logger.warning("executor.ack_failed", task_id=leased.task.task_id)
+                    logger.debug("executor.ack_failed", task_id=leased.task.task_id)
                 self._events.on_success(self, leased, latency, result)
                 try:
                     self._result_handler(leased, result)

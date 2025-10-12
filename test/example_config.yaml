@@ -13,7 +13,10 @@ task_system:
   pool:
     default_ttl: 30.0
     backend:
-      type: memory
+      type: file
+      path: output/queue
+      max_attempts: 3
+      retry_delay_seconds: 0.5
   executor:
     max_concurrency: 2
     lease_batch_size: 2

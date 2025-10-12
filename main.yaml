@@ -39,13 +39,13 @@ task_system:
   # 执行器策略
   executor:
     # 最大并发 worker 数
-    max_concurrency: 4
+    max_concurrency: 32
     # 每次租借任务数
-    lease_batch_size: 4
+    lease_batch_size: 64
     # 租约时长（秒）
-    lease_ttl: 10.0
+    lease_ttl: 30.0
     # 预取队列长度
-    prefetch: 8
+    prefetch: 128
     # 空闲等待时间（秒）
     idle_sleep: 0.1
     # 最大重试次数
@@ -71,7 +71,7 @@ task_partitioner:
   # 默认约束参数
   defaults:
     # 每个任务最大条目数
-    max_items_per_task: 12
+    max_items_per_task: 128
     # 切分洗牌种子
     shuffle_seed: 42
 # S2 阶段配置
@@ -99,7 +99,7 @@ s2:
       # 分组字段
       group_by: null
       # 单任务最大条目数
-      max_items_per_task: 256
+      max_items_per_task: 128
       # 任务数量上限（null 表示自动）
       max_tasks: null
       # 切分洗牌种子
