@@ -576,11 +576,50 @@
 5.在 test/example_runner.py 的例子中，加入使用 进度打印功能的组件 的使用，作为一个完整使用 base_components 各个组件主要功能的样例。
 
 
-1.signature_pipeline.py 重命名为 s2.1_signature_pipeline.py
-2.dedup_pipeline.py 重命名为 s2.2dedup_pipeline.py
-3.s2.1和s2.2都增加输出进度的功能，不要每个进程都打印进度，仅需主进程打印总进度即可。最小进度粒度是1%。使用 tqdm 实现。
-4.main.yaml 的 signature 名字改为 s2.1_signature， dedup 名字改为 s2.2_signature
-4.s2.1_signature_pipeline.py 的执行命令应该是 python app/s2/s2.1_signature_pipeline.py -config main.yaml ，需要实现该执行命令相关代码，即添加 main 函数
-5.s2.2dedup_pipeline.py 的执行命令应该是 python app/s2/s2.2dedup_pipeline.py -config main.yaml ，需要实现该执行命令相关代码，即添加 main 函数
+【在 main.yaml 配置中控制，只有error级别及以上的日志打印到控制台】
+【signature_pipeline.py 重命名为 s2.1_signature_pipeline.py】
+【dedup_pipeline.py 重命名为 s2.2dedup_pipeline.py】
+【s2.1和s2.2都使用 progress.py 实现进度打印】
+【main.yaml 的 signature 名字改为 s2.1_signature， dedup 名字改为 s2.2_signature】
+【s2.1_signature_pipeline.py 的执行命令应该是 python app/s2/s2.1_signature_pipeline.py -config main.yaml ，需要实现该执行命令相关代码，即添加 main 函数】
+【s2.2dedup_pipeline.py 的执行命令应该是 python app/s2/s2.2dedup_pipeline.py -config main.yaml ，需要实现该执行命令相关代码，即添加 main 函数】
+
+
+【main.yaml 的 s2.2_signature 名字改为 s2.2_dedup】
+【s2.2_dedup_pipeline.py的输入是 s2.1_signature_pipeline.py 的输出吗？】
+
+
+执行  python app/s2/s2.1_signature_pipeline.py --config main.yaml 命令 时（目前还在执行）：
+【在控制台不应该有输出了 info 级别，控制台只打印error级别及以上的日志 或进度】
+【没有进度输出，好像卡死了一样】
+
+
+为什么会抛出 Task exceeds max_items_per_task 异常呢？ max_tasks 已经是 null 了
+
+
+【日志统一打印到 /workspace/Gjj Doc/Code/CAD_TabPFN_1/logs 目录里】
+【刚刚执行还是抛出 Task exceeds max_items_per_task 异常，为什么呢？】
+
+
+【修改 base_components ，在分割任务做计划时，也需要加入进度条功能（可以使用progress.py实现）】
+
+
+现在正在执行 pkill -9 -f "python app/s2/s2.1_signature_pipeline.py --config main.yaml"
+【没有进度输出，如果是在做计划，应该也有进度输出才对吧？】
+
+
+【进度条改为最小是0.01%，这里应该修改底层的progress.py组件来实现】
+【TaskPartitioner:   0%|          |  0/100 [...]  这一行进度，我没看到在控制台有输出，是什么原因？】
+【还是 ValueError: Task exceeds max_items_per_task。在执行命令前我已经 pkill -9 -f "python app/s2/s2.1_signature_pipeline.py --config main.yaml" 杀过之前的进程了。】
+
+刚刚的执行 python app/s2/s2.1_signature_pipeline.py --config main.yaml，进程还在，什么都没有输出，你排查一下。你也可以看看日志，我没看到日志有什么输出。
+
+
+【删除 resource.py】
+【删除 config.py 密钥代理相关逻辑】
+【PyYAML 是必定存在的，删除“在缺少 PyYAML 时提供极简 YAML 解析器接口的垫片”等相关代码逻辑】
+
+【修改 example_runner.py，使其能正确执行】
+【后续所有回答都使用中文】
 
 EOF

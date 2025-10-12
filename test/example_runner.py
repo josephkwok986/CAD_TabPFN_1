@@ -79,6 +79,16 @@ def ensure_output_root(base_dir: Path) -> Path:
     return output_root
 
 
+def bootstrap_config(base_dir: Path) -> Config:
+    """加载示例配置并确保 Config 单例已就绪。"""
+    config_path = (base_dir / "example_config.yaml").resolve()
+    if not config_path.exists():
+        raise FileNotFoundError(f"示例配置缺失: {config_path}")
+    os.environ["CAD_TASK_CONFIG"] = str(config_path)
+    Config.set_singleton(None)
+    return Config.load_singleton(config_path)
+
+
 def prefer_fork_context() -> None:
     """在支持的环境下优先使用 fork 上下文，避免 spawn 受限。"""
     if getattr(prefer_fork_context, "_patched", False):
@@ -199,9 +209,8 @@ def main() -> None:
     base_dir = Path(__file__).resolve().parent  # 示例资源所在目录。
     output_root = ensure_output_root(base_dir)  # 初始化输出目录结构。
 
-    os.environ.setdefault("CAD_TASK_CONFIG", str(base_dir / "example_config.yaml"))  # 指定示例配置。
+    config = bootstrap_config(base_dir)
     ensure_task_config()
-    config = Config.get_singleton()
 
     logger = StructuredLogger.get_logger("demo.runner")
     logger.info("example.start", base_dir=str(base_dir))

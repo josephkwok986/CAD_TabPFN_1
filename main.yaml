@@ -17,7 +17,15 @@ logger:
       # 流类型
       stream: stdout
       # 最低输出级别
-      min_level: INFO
+      min_level: ERROR
+    - # 文件输出通道
+      type: rotating_file
+      # 日志文件路径
+      path: "/workspace/Gjj Doc/Code/CAD_TabPFN_1/logs/pipeline.log"
+      # 单文件最大尺寸（字节）
+      max_bytes: 10485760
+      # 轮转备份数量
+      backups: 5
 # 任务系统参数
 task_system:
   # 任务池设置
@@ -69,7 +77,7 @@ task_partitioner:
 # S2 阶段配置
 s2:
   # S2.1 几何签名提取
-  signature:
+  's2.1_signature':
     # 原始 CAD 数据根目录
     raw_root: "/workspace/Gjj Local/data/CAD/CAD_data"
     # S2 输出根目录
@@ -89,15 +97,15 @@ s2:
       # 切分策略名称
       strategy: weighted
       # 分组字段
-      group_by: source_dataset
+      group_by: null
       # 单任务最大条目数
-      max_items_per_task: 12
+      max_items_per_task: 256
       # 任务数量上限（null 表示自动）
       max_tasks: null
       # 切分洗牌种子
       shuffle_seed: 42
   # S2.2 去重聚类
-  dedup:
+  's2.2_dedup':
     # S2 输出根目录（复用 S2.1 输出）
     out_root: "/workspace/Gjj Local/data/CAD/step_out/s2_out"
     # FAISS 计算设备偏好

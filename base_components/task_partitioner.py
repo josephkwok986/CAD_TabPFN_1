@@ -32,6 +32,8 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
+from .progress import ProgressController
+
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -294,6 +296,8 @@ def _normalise_items(items: Iterable[Any], constraints: PartitionConstraints) ->
         resolved_group = _resolve_group_key(data_for_group, constraints)
         if resolved_group is not None:
             group_key = resolved_group
+        if group_key is None:
+            group_key = f"__item_{idx}"
         checksum_val = checksum or _blake2_hexdigest(payload_ref, weight, group_key)
         normalised.append(
             ItemRecord(
@@ -434,7 +438,13 @@ def _estimate_task_count(total_items: int, total_weight: float, constraints: Par
 # ---------------------------------------------------------------------------
 
 
-def _plan_fixed(job_spec: Mapping[str, Any], grouped_items: Sequence[Tuple[Optional[str], List[ItemRecord]]], constraints: PartitionConstraints, seed: int) -> List[_TaskBuilder]:
+def _plan_fixed(
+    job_spec: Mapping[str, Any],
+    grouped_items: Sequence[Tuple[Optional[str], List[ItemRecord]]],
+    constraints: PartitionConstraints,
+    seed: int,
+    progress: Optional[ProgressController] = None,
+) -> List[_TaskBuilder]:
     builders: List[_TaskBuilder] = []
     current = _TaskBuilder(job_id=str(job_spec["job_id"]), attempt=0, constraints=constraints, seed=seed, index=0)
     for group_key, items in grouped_items:
@@ -456,6 +466,8 @@ def _plan_fixed(job_spec: Mapping[str, Any], grouped_items: Sequence[Tuple[Optio
             builders.append(current)
             current = _TaskBuilder(job_id=str(job_spec["job_id"]), attempt=0, constraints=constraints, seed=seed, index=len(builders))
         current.add_group(items)
+        if progress:
+            progress.advance(1)
     if current.item_count > 0 or not builders:
         builders.append(current)
     if constraints.max_tasks and len(builders) > constraints.max_tasks:
@@ -463,7 +475,13 @@ def _plan_fixed(job_spec: Mapping[str, Any], grouped_items: Sequence[Tuple[Optio
     return builders
 
 
-def _plan_weighted(job_spec: Mapping[str, Any], grouped_items: Sequence[Tuple[Optional[str], List[ItemRecord]]], constraints: PartitionConstraints, seed: int) -> List[_TaskBuilder]:
+def _plan_weighted(
+    job_spec: Mapping[str, Any],
+    grouped_items: Sequence[Tuple[Optional[str], List[ItemRecord]]],
+    constraints: PartitionConstraints,
+    seed: int,
+    progress: Optional[ProgressController] = None,
+) -> List[_TaskBuilder]:
     job_id = str(job_spec["job_id"])
     totals = [sum(item.weight for item in group_items) for _, group_items in grouped_items]
     total_weight = sum(totals)
@@ -502,10 +520,18 @@ def _plan_weighted(job_spec: Mapping[str, Any], grouped_items: Sequence[Tuple[Op
             builder = _TaskBuilder(job_id=job_id, attempt=0, constraints=constraints, seed=seed, index=new_index)
             builder.add_group(items)
             builders.append(builder)
+        if progress:
+            progress.advance(1)
     return builders
 
 
-def _plan_hash(job_spec: Mapping[str, Any], grouped_items: Sequence[Tuple[Optional[str], List[ItemRecord]]], constraints: PartitionConstraints, seed: int) -> List[_TaskBuilder]:
+def _plan_hash(
+    job_spec: Mapping[str, Any],
+    grouped_items: Sequence[Tuple[Optional[str], List[ItemRecord]]],
+    constraints: PartitionConstraints,
+    seed: int,
+    progress: Optional[ProgressController] = None,
+) -> List[_TaskBuilder]:
     if not constraints.max_tasks or constraints.max_tasks <= 0:
         raise ValueError("Hash strategy requires max_tasks to be specified and > 0")
     job_id = str(job_spec["job_id"])
@@ -525,12 +551,20 @@ def _plan_hash(job_spec: Mapping[str, Any], grouped_items: Sequence[Tuple[Option
         if constraints.max_items_per_task and projected_items > constraints.max_items_per_task:
             raise ValueError("Hash bucket would exceed max_items_per_task")
         builder.add_group(items)
+        if progress:
+            progress.advance(1)
     return builders
 
 
-def _plan_group_aware(job_spec: Mapping[str, Any], grouped_items: Sequence[Tuple[Optional[str], List[ItemRecord]]], constraints: PartitionConstraints, seed: int) -> List[_TaskBuilder]:
+def _plan_group_aware(
+    job_spec: Mapping[str, Any],
+    grouped_items: Sequence[Tuple[Optional[str], List[ItemRecord]]],
+    constraints: PartitionConstraints,
+    seed: int,
+    progress: Optional[ProgressController] = None,
+) -> List[_TaskBuilder]:
     # Group-aware strategy first clusters by group key and then applies weighted placement.
-    return _plan_weighted(job_spec, grouped_items, constraints, seed)
+    return _plan_weighted(job_spec, grouped_items, constraints, seed, progress)
 
 
 _STRATEGY_IMPL = {
@@ -605,7 +639,16 @@ class TaskPartitioner:
         history = list(cfg_meta.get("strategy_history", []))
         history.append(str(strategy_obj))
         cfg_meta["strategy_history"] = history
-        plan = _build_plan(job_spec, impl(job_spec, grouped, parsed_constraints, seed), strategy_obj, parsed_constraints, cfg_meta)
+        progress: Optional[ProgressController] = None
+        if grouped:
+            progress = ProgressController(total_units=len(grouped), description="TaskPartitioner")
+            progress.start()
+        try:
+            builders = impl(job_spec, grouped, parsed_constraints, seed, progress)
+        finally:
+            if progress is not None:
+                progress.close()
+        plan = _build_plan(job_spec, builders, strategy_obj, parsed_constraints, cfg_meta)
         return plan
 
     @classmethod

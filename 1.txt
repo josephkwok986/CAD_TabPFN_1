@@ -4,10 +4,19 @@ docker run -it -v "/mnt/c/Users/GJJ/":/workspace -v "/mnt/c/Users/GJJ/Gjj Doc/Co
 
 docker exec -it tc bash -c "cd /workspace/'Gjj Doc'/Code && exec /bin/bash"
 
-python -m app.s2.pipeline --config main.yaml
+
+python app/s2/s2.1_signature_pipeline.py --config main.yaml
 
 
-pkill -9 -f "python -m app.s2.pipeline"
+
+
+
+1.为什么 S2.1 执行很久后才有进度首次输出呢？
+2. S2.1 前面阶段划分任务耗时太久了吗？为什么会花很长时间才真正开始执行任务呢？
+
+
+
+pkill -9 -f "python app/s2/s2.1_signature_pipeline.py --config main.yaml"
 ps -ef | grep -v grep | grep "python -m app.s2.pipeline"
 
 

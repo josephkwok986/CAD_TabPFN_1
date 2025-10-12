@@ -8,7 +8,6 @@ Implements a unified configuration loader and validator with:
 - layered overrides (defaults, file, env prefix, CLI)
 - schema validation (Pydantic or JSON Schema)
 - versioned migration pipeline
-- secrets proxy with env resolver and redaction
 - snapshot freeze with canonical SHA-256 fingerprint
 - reload()
 - export() to yaml/json/dict
@@ -26,7 +25,6 @@ import io
 import re
 import json
 import copy
-import hmac
 import hashlib
 import signal
 import threading
@@ -222,70 +220,6 @@ _YamlLoader.add_constructor("!include", _yaml_include_constructor)
 
 
 # ------------------------
-# Secrets proxy
-# ------------------------
-
-class SecretsProxy(dict):
-    """
-    Read-only secrets view. Values are resolved on access.
-    Supported references:
-      - "env:VAR_NAME" -> os.environ["VAR_NAME"]
-      - "${VAR_NAME}" inside strings
-      - plain value
-    Custom resolvers can be provided via scheme -> callable(str) -> str
-    """
-    def __init__(self, raw: dict, resolvers: Optional[Dict[str, Callable[[str], str]]] = None):
-        super().__init__()
-        self._raw = copy.deepcopy(raw or {})
-        self._resolvers = {"env": lambda key: os.environ[key]}
-        if resolvers:
-            self._resolvers.update(resolvers)
-
-    def _resolve_value(self, v: Any) -> Any:
-        if isinstance(v, str):
-            if v.startswith("env:"):
-                _, key = v.split(":", 1)
-                return os.environ.get(key, "")
-            # allow scheme:value for future resolvers
-            if ":" in v and not v.startswith("${"):
-                scheme, key = v.split(":", 1)
-                if scheme in self._resolvers:
-                    return self._resolvers[scheme](key)
-            return _sub_env_in_str(v)
-        if isinstance(v, list):
-            return [self._resolve_value(i) for i in v]
-        if isinstance(v, dict):
-            return {k: self._resolve_value(x) for k, x in v.items()}
-        return v
-
-    # read-only mapping API
-    def __getitem__(self, key):
-        return self._resolve_value(self._raw[key])
-
-    def get(self, key, default=None):
-        try:
-            return self.__getitem__(key)
-        except KeyError:
-            return default
-
-    def __setitem__(self, key, value):
-        raise TypeError("SecretsProxy is read-only")
-
-    def update(self, *args, **kwargs):  # type: ignore
-        raise TypeError("SecretsProxy is read-only")
-
-    def to_redacted_dict(self) -> dict:
-        def redact(v):
-            if isinstance(v, (dict, list)):
-                return "***"
-            return "***"
-        return {k: redact(v) for k, v in self._raw.items()}
-
-    def __repr__(self) -> str:
-        return f"SecretsProxy(keys={list(self._raw.keys())})"
-
-
-# ------------------------
 # Migrator registry
 # ------------------------
 
@@ -346,11 +280,9 @@ class Config:
         self._path: Optional[Path] = None
         self._strict_mode: bool = True
         self._migrators = MigratorRegistry()
-        self._secrets_proxy: Optional[SecretsProxy] = None
         self._last_info: Optional[LoadInfo] = None
         self._watcher_thread: Optional[threading.Thread] = None
         self._watch_stop = threading.Event()
-        self._secret_resolvers: Dict[str, Callable[[str], str]] = {}
 
     # ---------- Interface ----------
 
@@ -364,7 +296,6 @@ class Config:
         cli_overrides: Optional[Dict[str, Any]] = None,
         strict: bool = True,
         enable_sighup: bool = False,
-        secret_resolvers: Optional[Dict[str, Callable[[str], str]]] = None,
         migrate_to: Optional[int] = None,
     ) -> "Config":
         """
@@ -385,7 +316,6 @@ class Config:
         self._env_prefix = env_prefix
         self._defaults = copy.deepcopy(defaults or {})
         self._strict_mode = bool(str(strict).lower() not in {"0", "false"})
-        self._secret_resolvers = secret_resolvers or {}
 
         # Read and parse YAML
         if isinstance(path_or_stream, (str, Path)):
@@ -416,12 +346,6 @@ class Config:
         # Version migrations
         merged = self._migrators.migrate(merged, target_version=migrate_to)
 
-        # Secrets proxy
-        if isinstance(merged.get("secrets", None), dict):
-            self._secrets_proxy = SecretsProxy(merged["secrets"], resolvers=self._secret_resolvers)
-        else:
-            self._secrets_proxy = SecretsProxy({}, resolvers=self._secret_resolvers)
-
         # Validation
         validated = False
         if schema is not None:
@@ -442,7 +366,7 @@ class Config:
         self._data = merged
 
         # Observability info
-        fingerprint = self._fingerprint(redact_secrets=True)
+        fingerprint = self._fingerprint()
         version = _deep_get(merged, "config.version", None)
         source = str(self._path) if self._path else "<stream>"
         self._last_info = LoadInfo(source=source, version=version, validated=validated, fingerprint=fingerprint)
@@ -463,7 +387,6 @@ class Config:
         cli_overrides: Optional[Dict[str, Any]] = None,
         strict: bool = True,
         enable_sighup: bool = False,
-        secret_resolvers: Optional[Dict[str, Callable[[str], str]]] = None,
         migrate_to: Optional[int] = None,
     ) -> "Config":
         return cls._load_instance(
@@ -474,7 +397,6 @@ class Config:
             cli_overrides=cli_overrides,
             strict=strict,
             enable_sighup=enable_sighup,
-            secret_resolvers=secret_resolvers,
             migrate_to=migrate_to,
         )
 
@@ -488,7 +410,6 @@ class Config:
         cli_overrides: Optional[Dict[str, Any]] = None,
         strict: bool = True,
         enable_sighup: bool = False,
-        secret_resolvers: Optional[Dict[str, Callable[[str], str]]] = None,
         migrate_to: Optional[int] = None,
     ) -> "Config":
         instance = cls._load_instance(
@@ -499,7 +420,6 @@ class Config:
             cli_overrides=cli_overrides,
             strict=strict,
             enable_sighup=enable_sighup,
-            secret_resolvers=secret_resolvers,
             migrate_to=migrate_to,
         )
         with cls._singleton_lock:
@@ -519,15 +439,8 @@ class Config:
             return cls._singleton
 
     def get(self, key: str, type: type, default: Any = None) -> Any:
-        """
-        Fetch dot-path key. Cast to given type.
-        Secrets: use "secrets.X" for resolved secret value.
-        """
-        if key.startswith("secrets.") and self._secrets_proxy is not None:
-            _, sub = key.split("secrets.", 1)
-            val = self._secrets_proxy.get(sub, default)
-        else:
-            val = _deep_get(self._data, key, default)
+        """Fetch dot-path key. Cast to given type."""
+        val = _deep_get(self._data, key, default)
         if val is None and default is not None:
             return default
         if type is Any or type is None:
@@ -554,22 +467,18 @@ class Config:
             defaults=self._defaults,
             env_prefix=self._env_prefix,
             strict=self._strict_mode,
-            secret_resolvers=self._secret_resolvers,
         )
         # Copy state
         self._data = current._data
-        self._secrets_proxy = current._secrets_proxy
         self._last_info = current._last_info
 
     def freeze(self) -> "ConfigSnapshot":
         """Return an immutable snapshot with version and fingerprint."""
         data = copy.deepcopy(self._data)
-        return ConfigSnapshot(data, secrets=self._secrets_proxy)
+        return ConfigSnapshot(data)
 
     def export(self, fmt: str = "yaml", redact_secrets: bool = True) -> Union[str, dict]:
-        """
-        Export configuration in yaml/json/dict with optional redaction of secrets.
-        """
+        """Export configuration in yaml/json/dict. `redact_secrets` is kept for compatibility."""
         data = self._exportable_dict(redact_secrets=redact_secrets)
         if fmt == "dict":
             return data
@@ -591,38 +500,26 @@ class Config:
 
     # ---------- Internals ----------
 
-    def _exportable_dict(self, redact_secrets: bool) -> dict:
-        data = copy.deepcopy(self._data)
-        if self._secrets_proxy is not None:
-            data["secrets"] = self._secrets_proxy.to_redacted_dict() if redact_secrets else copy.deepcopy(self._secrets_proxy._raw)
-        return data
+    def _exportable_dict(self, redact_secrets: bool = True) -> dict:  # pragma: no cover - param kept for compat
+        return copy.deepcopy(self._data)
 
-    def _fingerprint(self, redact_secrets: bool) -> str:
-        exportable = self._exportable_dict(redact_secrets=redact_secrets)
+    def _fingerprint(self) -> str:
+        exportable = self._exportable_dict(redact_secrets=True)
         return _sha256(_canonical_json(exportable))
 
 
 class ConfigSnapshot:
     """Immutable view of configuration with fingerprint and helpers."""
-    __slots__ = ("_data", "_secrets", "version", "fingerprint")
+    __slots__ = ("_data", "version", "fingerprint")
 
-    def __init__(self, data: dict, secrets: Optional[SecretsProxy] = None):
-        # freeze
+    def __init__(self, data: dict):
         d = copy.deepcopy(data)
         self._data = MappingProxyType(d)  # read-only mapping
-        self._secrets = secrets or SecretsProxy({})
         self.version = _deep_get(d, "config.version", None)
-        # hash with secrets redacted
-        exportable = copy.deepcopy(d)
-        exportable["secrets"] = self._secrets.to_redacted_dict()
-        self.fingerprint = _sha256(_canonical_json(exportable))
+        self.fingerprint = _sha256(_canonical_json(d))
 
     def get(self, key: str, type: type, default: Any = None) -> Any:
-        if key.startswith("secrets."):
-            _, sub = key.split("secrets.", 1)
-            val = self._secrets.get(sub, default)
-        else:
-            val = _deep_get(self._data, key, default)
+        val = _deep_get(self._data, key, default)
         if val is None and default is not None:
             return default
         if type is Any or type is None:
@@ -639,8 +536,8 @@ class ConfigSnapshot:
             raise
 
     def export(self, fmt: str = "yaml", redact_secrets: bool = True) -> Union[str, dict]:
+        """Export snapshot data. `redact_secrets` is kept for compatibility."""
         data = copy.deepcopy(dict(self._data))
-        data["secrets"] = self._secrets.to_redacted_dict() if redact_secrets else copy.deepcopy(self._secrets._raw)
         if fmt == "dict":
             return data
         if fmt == "json":
@@ -712,7 +609,6 @@ def test():
     class TestConfig(unittest.TestCase):
         def setUp(self):
             # env for tests
-            os.environ["DB_PASS"] = "secret_from_env"
             os.environ["APP__db__host"] = "ignored_lowercase"
             os.environ["APP__db__port"] = "6543"
             os.environ["APP__io__rate_limit"] = "42"
@@ -743,8 +639,6 @@ def test():
                 io:
                   root: "/tmp"
                   retry: 3
-                secrets:
-                  db_password: "env:DB_PASS"
                 """, d, "conf.yml")
 
                 cfg = Config.load(main, defaults={"io": {"retry": 1}}, env_prefix="APP")
@@ -758,14 +652,10 @@ def test():
                 self.assertEqual(cfg.get("db.port", int, 0), 6543)
                 # lists from env JSON
                 self.assertEqual(cfg.get("list.values", list), [1,2,3])
-                # secret resolved
-                self.assertEqual(cfg.get("secrets.db_password", str), "secret_from_env")
 
                 # exports
                 as_dict = cfg.export("dict")
                 self.assertEqual(as_dict["io"]["retry"], 3)
-                # secrets redacted
-                self.assertEqual(as_dict["secrets"]["db_password"], "***")
                 yml = cfg.export("yaml")
                 jsn = cfg.export("json")
                 self.assertTrue(isinstance(yml, str) and isinstance(jsn, str))
@@ -883,7 +773,7 @@ if __name__ == "__main__":
     #test()
     cfg = Config.load_singleton('main.yaml')
     exported = cfg.export("json")
-    print("## EXPORT(JSON, redacted)")
+    print("## EXPORT(JSON)")
     print(json.dumps(json.loads(exported), ensure_ascii=False, indent=2))
 
     # 逐项读取示例
@@ -903,7 +793,6 @@ if __name__ == "__main__":
     show("limits.concurrency", int, 0)
     show("db.host", str)
     show("db.port", int)
-    show("secrets.db_password", str, "")
 
     # 指纹与版本
     info = cfg.last_load_info
