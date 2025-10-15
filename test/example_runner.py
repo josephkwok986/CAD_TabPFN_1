@@ -129,7 +129,7 @@ class ExampleFrameworkJob(TaskFramework):
         self._output_root = _ensure_output_root(self._base_dir)
         self._planner_items: List[Dict[str, Any]] = []
         self._items_map: Dict[str, Dict[str, Any]] = {}
-        self._job_id = "demo-job"
+        self.set_job_id("demo-job")
         self._pc: Optional[ProgressController] = None
         self._log = StructuredLogger.get_logger("demo.framework_job")
 
@@ -178,7 +178,7 @@ class ExampleFrameworkJob(TaskFramework):
         strategy = cfg.get("example.strategy", str, PartitionStrategy.FIXED) if cfg else PartitionStrategy.FIXED
 
         constraints = PartitionConstraints(max_items_per_task=chunk_size)
-        job_spec = {"job_id": self._job_id}
+        job_spec = {"job_id": self.job_id}
 
         for task in TaskPartitioner.iter_tasks(job_spec, self._planner_items, strategy, constraints):
             if self._pc is not None:

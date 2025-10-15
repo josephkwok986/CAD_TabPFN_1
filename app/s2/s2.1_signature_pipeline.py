@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""S2.1：基于 base_components 的几何签名提取流水线。"""
+"""S2.1：基于 TaskFramework 的几何签名提取流水线。"""
 
 from __future__ import annotations
 
@@ -9,10 +9,10 @@ import contextlib
 import hashlib
 import json
 import math
-import shutil
-import multiprocessing as mp
 import os
 import re
+import shutil
+import multiprocessing as mp
 import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -24,16 +24,14 @@ import pandas as pd
 
 from base_components import (
     Config,
-    ExecutorPolicy,
-    ParallelExecutor,
     ProgressController,
     StructuredLogger,
     TaskPartitioner,
-    TaskPool,
 )
-from base_components.parallel_executor import TaskResult, _persist_task_result
+from base_components.main_framework import TaskFramework  # 继承框架
+from base_components.task_partitioner import PartitionConstraints, TaskRecord
 from base_components.task_pool import LeasedTask
-from base_components.task_partitioner import PartitionConstraints
+from base_components.parallel_executor import TaskResult, _persist_task_result
 
 from OCC.Core.STEPControl import STEPControl_AsIs, STEPControl_Reader, STEPControl_Writer
 from OCC.Core.IFSelect import IFSelect_RetDone
@@ -64,11 +62,9 @@ _GPU_CUPY = False
 SUPPORTED_STEP = {".step", ".stp", ".stpz"}
 SUPPORTED_BREP = {".brep", ".brp"}
 
-
-# ---------------------------------------------------------------------------
-# 配置结构
-# ---------------------------------------------------------------------------
-
+# ---------------------------
+# 配置
+# ---------------------------
 
 @dataclass
 class PartitionConfig:
@@ -85,19 +81,10 @@ class PartitionConfig:
             strategy=str(data.get("strategy", "weighted")),
             group_by=data.get("group_by", "source_dataset"),
             max_items_per_task=int(data.get("max_items_per_task", 16)) if data.get("max_items_per_task") else 16,
-            max_weight_per_task=(
-                float(data["max_weight_per_task"])
-                if data.get("max_weight_per_task") is not None
-                else None
-            ),
-            shuffle_seed=(
-                int(data["shuffle_seed"])
-                if data.get("shuffle_seed") is not None
-                else None
-            ),
+            max_weight_per_task=(float(data["max_weight_per_task"]) if data.get("max_weight_per_task") is not None else None),
+            shuffle_seed=(int(data["shuffle_seed"]) if data.get("shuffle_seed") is not None else None),
             max_tasks=int(data["max_tasks"]) if data.get("max_tasks") is not None else None,
         )
-
 
 @dataclass
 class SignatureConfig:
@@ -128,11 +115,9 @@ class SignatureConfig:
             partition=partition_cfg,
         )
 
-
-# ---------------------------------------------------------------------------
-# 通用工具
-# ---------------------------------------------------------------------------
-
+# ---------------------------
+# 工具
+# ---------------------------
 
 def _ensure_cupy() -> None:
     global cp, _GPU_CUPY
@@ -140,13 +125,11 @@ def _ensure_cupy() -> None:
         return
     try:
         import cupy as _cp  # type: ignore
-
         cp = _cp
         _GPU_CUPY = True
     except Exception:
         cp = None
         _GPU_CUPY = False
-
 
 def read_text_prefix(path: str, max_bytes: int = 200000) -> Optional[str]:
     try:
@@ -159,13 +142,11 @@ def read_text_prefix(path: str, max_bytes: int = 200000) -> Optional[str]:
             return blob.decode(encoding, errors="ignore")
     return None
 
-
 _STEP_FILE_NAME_RE = re.compile(
     r"FILE_NAME\s*\(\s*'([^']*)'\s*,\s*'([^']*)'\s*,\s*\((.*?)\)\s*,\s*\((.*?)\)\s*,\s*'([^']*)'\s*,\s*'([^']*)'\s*,\s*'([^']*)'\s*\)",
     re.IGNORECASE | re.DOTALL,
 )
 _STEP_FILE_SCHEMA_RE = re.compile(r"FILE_SCHEMA\s*\(\s*\(\s*'([^']+)'\s*\)\s*\)", re.IGNORECASE)
-
 
 def parse_step_header_text(text: str) -> Dict[str, Optional[str]]:
     meta = {
@@ -187,18 +168,22 @@ def parse_step_header_text(text: str) -> Dict[str, Optional[str]]:
             timestamp = m_name.group(2).strip()
             meta["created_at_header"] = _normalize_datetime(timestamp)
             authors_raw = m_name.group(3).strip()
-            authors = [a.strip().strip("'") for a in authors_raw.split(",") if a.strip()]
-            meta["author"] = "|".join(authors) if authors else None
-            meta["originating_system"] = m_name.group(6).strip().strip("'")
-    up = text.upper()
-    if "INCH" in up:
-        meta["unit"], meta["unit_source"] = "inch", "inferred_step_data"
-    elif "MILLI" in up and "METRE" in up:
-        meta["unit"], meta["unit_source"] = "mm", "inferred_step_data"
-    elif "METRE" in up:
-        meta["unit"], meta["unit_source"] = "m", "inferred_step_data"
+            authors = [a.strip().strip("'") for a in authors_raw.split(",")]
+            meta["author"] = authors[0] if authors else None
+            meta["originating_system"] = m_name.group(5).strip()
     return meta
 
+def _normalize_datetime(text: str) -> Optional[str]:
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y-%m-%d"):
+        with contextlib.suppress(Exception):
+            return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc).isoformat()
+    return None
+
+def safe_rel(root: Path, path: Path) -> str:
+    try:
+        return os.path.relpath(path, root)
+    except Exception:
+        return str(path)
 
 def get_file_meta(path: str) -> Dict[str, Optional[str]]:
     try:
@@ -210,7 +195,12 @@ def get_file_meta(path: str) -> Dict[str, Optional[str]]:
         mtime_iso = None
     ext = os.path.splitext(path)[1].lower()
     fmt = "STEP" if ext in SUPPORTED_STEP else ("BREP" if ext in SUPPORTED_BREP else "UNKNOWN")
-    return {"file_ext": ext, "format": fmt, "file_size_bytes": size, "file_mtime_utc": mtime_iso}
+    return {
+        "file_ext": ext,
+        "format": fmt,
+        "file_size_bytes": size,
+        "file_mtime_utc": mtime_iso,
+    }
 
 
 def guess_kernel(fmt: str, originating_system: Optional[str]) -> Optional[str]:
@@ -228,29 +218,176 @@ def guess_kernel(fmt: str, originating_system: Optional[str]) -> Optional[str]:
     return None
 
 
-def occ_load_shape(path: str, logger: StructuredLogger) -> Optional[TopoDS_Shape]:
-    ext = os.path.splitext(path)[1].lower()
-    if ext in SUPPORTED_STEP:
-        reader = STEPControl_Reader()
-        status = reader.ReadFile(path)
-        if status != IFSelect_RetDone:
-            logger.debug("occ.step.read_failed", path=path)
-            return None
-        reader.TransferRoots()
-        return reader.OneShape()
-    if ext in SUPPORTED_BREP:
-        shape = TopoDS_Shape()
+def get_file_meta_all(raw_root: Path, fpath: Path) -> Dict[str, Optional[str]]:
+    rel = safe_rel(raw_root, fpath)
+    src = rel.split(os.sep)[0] if os.sep in rel else "unknown"
+    ch = sha256_file(str(fpath)) if fpath.exists() else ""
+    fm = get_file_meta(str(fpath))
+    text = None
+    if fm["format"] == "STEP" and fm["file_ext"] != ".stpz":
+        text = read_text_prefix(str(fpath), 300000)
+    step_hdr = parse_step_header_text(text or "")
+    kernel = guess_kernel(fm["format"], step_hdr.get("originating_system"))
+    parts = rel.split(os.sep)
+    repo = parts[1] if len(parts) >= 2 else None
+    created_hdr = step_hdr.get("created_at_header")
+    ts_src = "header" if created_hdr else ("mtime" if fm.get("file_mtime_utc") else "none")
+    return {
+        "rel": rel,
+        "src": src,
+        "ch": ch,
+        **fm,
+        **step_hdr,
+        "kernel": kernel,
+        "repo": repo,
+        "domain_hint": src,
+        "timestamp_source": ts_src,
+    }
+
+'''
+def discover_parts(raw_root: Path, subset_n: Optional[int], subset_frac: Optional[float], logger: StructuredLogger) -> Tuple[int, Iterable[Path]]:
+    logger.info("s2.1_signature.scan_start", root=str(raw_root))
+    exts = tuple(SUPPORTED_STEP | SUPPORTED_BREP)
+    paths = sorted([p for p in raw_root.rglob("*") if p.is_file() and p.suffix.lower() in exts])
+    total = len(paths)
+    if subset_n is not None:
+        paths = paths[: max(0, int(subset_n))]
+    elif subset_frac is not None:
+        k = max(0, min(total, int(math.ceil(float(subset_frac) * total))))
+        paths = paths[:k]
+    logger.info("s2.1_signature.scan_done", total=total, picked=len(paths), root=str(raw_root))
+    return len(paths), paths
+'''
+import os, math
+from pathlib import Path
+from typing import Iterable, Tuple, Optional
+
+def _norm_exts(exts):
+    # 统一成带点小写后缀元组，用于 endswith
+    out = []
+    for e in exts:
+        e = e.lower()
+        if not e.startswith("."):
+            e = "." + e
+        out.append(e)
+    return tuple(out)
+
+def _walk_lex(root: Path, exts: tuple) -> Iterable[str]:
+    # 目录、文件分别局部排序 => 等价于全局字典序，无需整体 sorted
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        filenames.sort()
+        for name in filenames:
+            if name.lower().endswith(exts):
+                yield os.path.join(dirpath, name)
+
+def discover_parts(raw_root: Path, subset_n: Optional[int], subset_frac: Optional[float], logger) -> Tuple[int, Iterable[Path]]:
+    logger.info("s2.1_signature.scan_start", root=str(raw_root))
+    exts = _norm_exts(SUPPORTED_STEP | SUPPORTED_BREP)
+
+    # 1) 只要前 N 个 => 单次遍历，流式早停
+    if subset_n is not None:
+        k = max(0, int(subset_n))
+        picked = []
+        for i, p in enumerate(_walk_lex(raw_root, exts)):
+            if i >= k:
+                break
+            picked.append(Path(p))
+        total = i if k == 0 else (i if len(picked) < k else i + 1)  # 近似总数；如需精确可再扫一次计数
+        logger.info("s2.1_signature.scan_done", total=total, picked=len(picked), root=str(raw_root))
+        return len(picked), picked
+
+    # 2) 比例抽取 => 两次轻量遍历：先计数再取前 k
+    if subset_frac is not None:
+        # 计数不排序不建大列表
+        total = sum(1 for _ in _walk_lex(raw_root, exts))
+        k = max(0, min(total, int(math.ceil(float(subset_frac) * total))))
+        picked = []
+        for i, p in enumerate(_walk_lex(raw_root, exts)):
+            if i >= k:
+                break
+            picked.append(Path(p))
+        logger.info("s2.1_signature.scan_done", total=total, picked=len(picked), root=str(raw_root))
+        return len(picked), picked
+
+    # 3) 全量但不全局排序列表：按遍历顺序即全局字典序
+    picked = [Path(p) for p in _walk_lex(raw_root, exts)]
+    total = len(picked)
+    logger.info("s2.1_signature.scan_done", total=total, picked=total, root=str(raw_root))
+    return total, picked
+
+def iter_items(paths: Iterable[Path], raw_root: Path, items_map: Dict[str, Dict[str, Any]], logger: StructuredLogger) -> Iterable[Dict[str, Any]]:
+    for idx, path in enumerate(paths, 1):
+        rel = safe_rel(raw_root, path)
+        dataset = rel.split(os.sep)[0] if os.sep in rel else "unknown"
         try:
-            ok = breptools_Read(shape, path, BRep_Builder())
-        except TypeError:
-            ok = breptools_Read(shape, path)
-        if not ok:
-            logger.debug("occ.brep.read_failed", path=path)
-            return None
-        return shape
-    return None
+            size = float(os.path.getsize(path))
+        except Exception:
+            size = 0.0
+        weight = max(1.0, size / (1024.0 * 1024.0))
+        metadata = {
+            "abs_path": str(path),
+            "source_dataset": dataset,
+            "file_ext": os.path.splitext(path)[1].lower(),
+            "rel_path": rel,
+        }
+        items_map[rel] = metadata
+        if idx % 100 == 0:
+            logger.debug("s2.1_signature.scan_progress", processed=idx)
+        yield {"payload_ref": rel, "weight": weight, "metadata": metadata}
 
+# ---------------------------
+# 几何签名
+# ---------------------------
 
+@dataclass
+class PartSig:
+    part_id: str
+    rel_path: str
+    source_dataset: str
+    content_hash: str
+    has_points: bool
+    d2_hist: Optional[np.ndarray] = None
+    bbox_ratio: Optional[np.ndarray] = None
+    surf_hist: Optional[np.ndarray] = None
+    dih_hist: Optional[np.ndarray] = None
+    geom_hash: Optional[str] = None
+
+def sha256_file(path: str, chunk: int = 1 << 20) -> str:
+    hasher = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            block = handle.read(chunk)
+            if not block:
+                break
+            hasher.update(block)
+    return hasher.hexdigest()
+
+def _encode_array(arr: Optional[np.ndarray]) -> str:
+    if arr is None:
+        return ""
+    return json.dumps(arr.tolist(), ensure_ascii=False)
+
+def build_row(sig: Optional[PartSig], meta: Mapping[str, Any], error: Optional[str]) -> Dict[str, Any]:
+    rel_path = meta.get("rel") or (sig.rel_path if sig else None) or "unknown"
+    source = meta.get("src") or (sig.source_dataset if sig else "unknown")
+    content_hash = meta.get("ch") or (sig.content_hash if sig else "")
+    part_id = sig.part_id if sig else rel_path
+    row = {
+        "part_id": part_id,
+        "rel_path": rel_path,
+        "source_dataset": source,
+        "content_hash": content_hash,
+        "has_points": int(sig.has_points) if sig else 0,
+        "d2_hist": _encode_array(sig.d2_hist if sig and sig.has_points else None),
+        "bbox_ratio": _encode_array(sig.bbox_ratio if sig and sig.has_points else None),
+        "surf_hist": _encode_array(sig.surf_hist if sig and sig.has_points else None),
+        "dih_hist": _encode_array(sig.dih_hist if sig and sig.has_points else None),
+        "geom_hash": sig.geom_hash if sig and sig.geom_hash else None,
+        "meta_json": json.dumps(meta, ensure_ascii=False),
+        "error": error or "",
+    }
+    return row
 def triangulate(shape: TopoDS_Shape, lin_defl: float = 0.5) -> None:
     with contextlib.suppress(TypeError):
         BRepMesh_IncrementalMesh(shape, lin_defl, True, 0.5, True)
@@ -286,6 +423,29 @@ def _append_nodes_from_triangulation(face: TopoDS_Face, loc: TopLoc_Location, pt
     except Exception:
         pass
     return added
+
+
+def occ_load_shape(path: str, logger: StructuredLogger) -> Optional[TopoDS_Shape]:
+    ext = os.path.splitext(path)[1].lower()
+    if ext in SUPPORTED_STEP:
+        reader = STEPControl_Reader()
+        status = reader.ReadFile(path)
+        if status != IFSelect_RetDone:
+            logger.debug("occ.step.read_failed", path=path)
+            return None
+        reader.TransferRoots()
+        return reader.OneShape()
+    if ext in SUPPORTED_BREP:
+        shape = TopoDS_Shape()
+        try:
+            ok = breptools_Read(shape, path, BRep_Builder())
+        except TypeError:
+            ok = breptools_Read(shape, path)
+        if not ok:
+            logger.debug("occ.brep.read_failed", path=path)
+            return None
+        return shape
+    return None
 
 
 def occ_shape_points(shape: TopoDS_Shape, n: int = 4096, lin_defl: float = 0.5) -> np.ndarray:
@@ -329,7 +489,13 @@ def normalize_points(points: np.ndarray) -> Tuple[np.ndarray, float]:
     return pts, diag
 
 
-def d2_descriptor(points: np.ndarray, num_pairs: int = 20000, num_bins: int = 64, seed: int = 42, device: str = "auto") -> np.ndarray:
+def d2_descriptor(
+    points: np.ndarray,
+    num_pairs: int = 20000,
+    num_bins: int = 64,
+    seed: int = 42,
+    device: str = "auto",
+) -> np.ndarray:
     n = points.shape[0]
     if n < 4:
         raise ValueError("Not enough points for D2 descriptor")
@@ -459,139 +625,6 @@ def occ_dihedral_hist(shape: TopoDS_Shape, bins: int = 36) -> np.ndarray:
     return hist
 
 
-@dataclass
-class PartSig:
-    part_id: str
-    rel_path: str
-    source_dataset: str
-    content_hash: str
-    has_points: bool
-    d2_hist: Optional[np.ndarray] = None
-    bbox_ratio: Optional[np.ndarray] = None
-    surf_hist: Optional[np.ndarray] = None
-    dih_hist: Optional[np.ndarray] = None
-    geom_hash: Optional[str] = None
-
-
-def sha256_file(path: str, chunk: int = 1 << 20) -> str:
-    hasher = hashlib.sha256()
-    with open(path, "rb") as handle:
-        while True:
-            block = handle.read(chunk)
-            if not block:
-                break
-            hasher.update(block)
-    return hasher.hexdigest()
-
-
-def safe_rel(root: Path, path: Path) -> str:
-    try:
-        return os.path.relpath(path, root)
-    except Exception:
-        return str(path)
-
-
-def get_file_meta_all(raw_root: Path, fpath: Path) -> Dict[str, Optional[str]]:
-    rel = safe_rel(raw_root, fpath)
-    src = rel.split(os.sep)[0] if os.sep in rel else "unknown"
-    ch = sha256_file(str(fpath))
-    fm = get_file_meta(str(fpath))
-    text = None
-    if fm["format"] == "STEP" and fm["file_ext"] != ".stpz":
-        text = read_text_prefix(str(fpath), 300000)
-    step_hdr = parse_step_header_text(text or "")
-    kernel = guess_kernel(fm["format"], step_hdr.get("originating_system"))
-    parts = rel.split(os.sep)
-    repo = parts[1] if len(parts) >= 2 else None
-    created_hdr = step_hdr.get("created_at_header")
-    ts_src = "header" if created_hdr else ("mtime" if fm.get("file_mtime_utc") else "none")
-    return {
-        "rel": rel,
-        "src": src,
-        "ch": ch,
-        **fm,
-        **step_hdr,
-        "kernel": kernel,
-        "repo": repo,
-        "domain_hint": src,
-        "timestamp_source": ts_src,
-    }
-
-
-def _count_parts(raw_root: Path) -> Tuple[int, int, int]:
-    total = 0
-    step_cnt = 0
-    brep_cnt = 0
-    for dirpath, _, filenames in os.walk(raw_root, followlinks=True):
-        for name in filenames:
-            ext = os.path.splitext(name)[1].lower()
-            if ext in SUPPORTED_STEP | SUPPORTED_BREP:
-                total += 1
-                if ext in SUPPORTED_STEP:
-                    step_cnt += 1
-                else:
-                    brep_cnt += 1
-    return total, step_cnt, brep_cnt
-
-
-def discover_parts(
-    raw_root: Path,
-    subset_n: Optional[int],
-    subset_frac: Optional[float],
-    logger: StructuredLogger,
-) -> Tuple[int, Iterable[Path]]:
-    total, step_cnt, brep_cnt = _count_parts(raw_root)
-    if total == 0:
-        logger.debug("s2.1_signature.discover", step_count=0, brep_count=0, total=0, selected=0)
-        return 0, []
-
-    limit = total
-    if subset_frac and 0 < subset_frac < 1:
-        limit = min(limit, max(1, int(total * subset_frac)))
-    if subset_n:
-        limit = min(limit, subset_n)
-
-    logger.debug(
-        "s2.1_signature.discover.start",
-        total=total,
-        step_count=step_cnt,
-        brep_count=brep_cnt,
-        limit=limit,
-    )
-
-    def iterator() -> Iterable[Path]:
-        emitted = 0
-        selected_step = 0
-        selected_brep = 0
-        for dirpath, _, filenames in os.walk(raw_root, followlinks=True):
-            for name in filenames:
-                ext = os.path.splitext(name)[1].lower()
-                if ext not in SUPPORTED_STEP | SUPPORTED_BREP:
-                    continue
-                if limit and emitted >= limit:
-                    break
-                full = Path(dirpath) / name
-                if ext in SUPPORTED_STEP:
-                    selected_step += 1
-                else:
-                    selected_brep += 1
-                emitted += 1
-                if emitted % 100 == 0:
-                    logger.debug("s2.1_signature.discover.progress", emitted=emitted, limit=limit)
-                yield full
-            if limit and emitted >= limit:
-                break
-        logger.debug(
-            "s2.1_signature.discover",
-            step_count=selected_step,
-            brep_count=selected_brep,
-            total=total,
-            selected=emitted,
-        )
-
-    return limit, iterator()
-
-
 def compute_signature_for_file(
     raw_root: Path,
     fpath: Path,
@@ -600,10 +633,13 @@ def compute_signature_for_file(
     *,
     device: str = "auto",
 ) -> Tuple[Optional[PartSig], Optional[str], Dict[str, Optional[str]]]:
+    if not fpath.is_absolute():
+        fpath = (raw_root / fpath).resolve()
     meta = get_file_meta_all(raw_root, fpath)
-    rel = meta["rel"] or fpath.name
-    src = meta["src"] or "unknown"
-    content_hash = meta["ch"] or ""
+    meta["abs_path"] = str(fpath)
+    rel = meta.get("rel") or fpath.name
+    src = meta.get("src") or "unknown"
+    content_hash = meta.get("ch") or ""
     shape = occ_load_shape(str(fpath), logger)
     if shape is None:
         sig = PartSig(rel, rel, src, content_hash, False, None, None, None, None, None)
@@ -624,43 +660,22 @@ def compute_signature_for_file(
             sig = PartSig(rel, rel, src, content_hash, False, None, None, None, None, None)
         return sig, None, meta
     except Exception as exc:
-        logger.debug("s2.1_signature.compute_failed", path=str(fpath), error=str(exc), traceback=traceback.format_exc())
+        logger.debug(
+            "s2.1_signature.compute_failed",
+            path=str(fpath),
+            error=str(exc),
+            traceback=traceback.format_exc(),
+        )
         return None, f"signature_failed:{rel}:{type(exc).__name__}", meta
 
-
-def _encode_array(arr: Optional[np.ndarray]) -> Optional[str]:
-    if arr is None:
-        return None
-    return json.dumps([float(x) for x in np.asarray(arr).ravel().tolist()])
-
-
-def build_row(sig: Optional[PartSig], meta: Mapping[str, Any], error: Optional[str]) -> Dict[str, Any]:
-    rel_path = meta.get("rel") or (sig.rel_path if sig else None) or "unknown"
-    source = meta.get("src") or (sig.source_dataset if sig else "unknown")
-    content_hash = meta.get("ch") or (sig.content_hash if sig else "")
-    part_id = sig.part_id if sig else rel_path
-    row = {
-        "part_id": part_id,
-        "rel_path": rel_path,
-        "source_dataset": source,
-        "content_hash": content_hash,
-        "has_points": int(sig.has_points) if sig else 0,
-        "d2_hist": _encode_array(sig.d2_hist if sig and sig.has_points else None),
-        "bbox_ratio": _encode_array(sig.bbox_ratio if sig and sig.has_points else None),
-        "surf_hist": _encode_array(sig.surf_hist if sig and sig.has_points else None),
-        "dih_hist": _encode_array(sig.dih_hist if sig and sig.has_points else None),
-        "geom_hash": sig.geom_hash if sig and sig.geom_hash else None,
-        "meta_json": json.dumps(meta, ensure_ascii=False),
-        "error": error or "",
-    }
-    return row
-
+# ---------------------------
+# 执行器兼容：首选 fork
+# ---------------------------
 
 def prefer_fork_context() -> None:
     if getattr(prefer_fork_context, "_patched", False):
         return
     original_get_context = mp.get_context
-
     def _patched(method: Optional[str] = None):
         target = method
         if method == "spawn":
@@ -669,182 +684,12 @@ def prefer_fork_context() -> None:
             except ValueError:
                 target = method
         return original_get_context(target)
-
     mp.get_context = _patched  # type: ignore[assignment]
     prefer_fork_context._patched = True  # type: ignore[attr-defined]
 
-
-def run_sequential_executor(
-    pool: TaskPool,
-    handler,
-    context: Dict[str, Any],
-    result_handler,
-    policy: ExecutorPolicy,
-    driver_logger: StructuredLogger,
-) -> None:
-    worker_logger = StructuredLogger.get_logger("app.s2.1_signature.sequential")
-    lease_ttl = getattr(policy, "lease_ttl", None)
-    if lease_ttl is None or lease_ttl <= 0:
-        lease_ttl = 10.0
-    filters = getattr(policy, "filters", None)
-
-    while True:
-        leased_batch = pool.lease(1, lease_ttl, filters=filters)
-        if not leased_batch:
-            break
-        leased = leased_batch[0]
-        try:
-            result = handler(leased, context)
-            _persist_task_result(result, worker_logger, leased.task.task_id)
-            pool.ack(leased.task.task_id)
-            result_handler(leased, result)
-        except Exception as exc:
-            pool.nack(leased.task.task_id, requeue=False, delay=None)
-            driver_logger.error("s2.1_signature.sequential_error", task_id=leased.task.task_id, error=str(exc))
-
-
-def aggregate_outputs(output_root: Path, logger: StructuredLogger) -> Dict[str, Any]:
-    cache_dir = output_root / "cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    frames: List[pd.DataFrame] = []
-    for csv_path in sorted(cache_dir.glob("*.csv")):
-        try:
-            if csv_path.stat().st_size == 0:
-                continue
-        except FileNotFoundError:
-            continue
-        try:
-            df = pd.read_csv(csv_path)
-            if not df.empty:
-                frames.append(df)
-        except Exception as exc:
-            logger.warning("s2.1_signature.load_cache_failed", file=str(csv_path), error=str(exc))
-    if frames:
-        df_all = pd.concat(frames, ignore_index=True)
-    else:
-        df_all = pd.DataFrame(
-            columns=[
-                "part_id",
-                "rel_path",
-                "source_dataset",
-                "content_hash",
-                "has_points",
-                "d2_hist",
-                "bbox_ratio",
-                "surf_hist",
-                "dih_hist",
-                "geom_hash",
-                "meta_json",
-                "error",
-            ]
-        )
-
-    sig_rows: List[Dict[str, Any]] = []
-    metas: Dict[str, Any] = {}
-    failures: List[str] = []
-
-    for _, row in df_all.iterrows():
-        err_val = row.get("error")
-        if pd.isna(err_val):
-            error = ""
-        else:
-            error = str(err_val or "").strip()
-        meta_raw = row.get("meta_json")
-        try:
-            meta = json.loads(meta_raw) if isinstance(meta_raw, str) and meta_raw else {}
-        except Exception:
-            meta = {}
-        part_id = str(row.get("part_id"))
-        if error:
-            failures.append(error)
-            continue
-        entry = {
-            "part_id": part_id,
-            "rel_path": row.get("rel_path"),
-            "source_dataset": row.get("source_dataset"),
-            "content_hash": row.get("content_hash"),
-            "has_points": int(row.get("has_points", 0)),
-            "d2_hist": row.get("d2_hist"),
-            "bbox_ratio": row.get("bbox_ratio"),
-            "surf_hist": row.get("surf_hist"),
-            "dih_hist": row.get("dih_hist"),
-            "geom_hash": row.get("geom_hash"),
-        }
-        sig_rows.append(entry)
-        metas[part_id] = meta
-
-    columns_order = [
-        "part_id",
-        "rel_path",
-        "source_dataset",
-        "content_hash",
-        "has_points",
-        "d2_hist",
-        "bbox_ratio",
-        "surf_hist",
-        "dih_hist",
-        "geom_hash",
-    ]
-    signatures_path = output_root / "signatures.csv"
-    metas_path = output_root / "metas.json"
-    failures_path = output_root / "failures.txt"
-    summary_path = output_root / "summary_s2_1.json"
-
-    if sig_rows:
-        pd.DataFrame(sig_rows)[columns_order].to_csv(signatures_path, index=False)
-    else:
-        pd.DataFrame(columns=columns_order).to_csv(signatures_path, index=False)
-    metas_path.write_text(json.dumps(metas, indent=2, ensure_ascii=False), encoding="utf-8")
-    if failures:
-        failures_path.write_text("\n".join(sorted(set(failures))), encoding="utf-8")
-    else:
-        if failures_path.exists():
-            failures_path.unlink()
-    summary = {
-        "num_parts": len(sig_rows),
-        "num_failed": len(failures),
-        "gpu_available": {"cupy": _GPU_CUPY},
-        "out_files": {
-            "signatures": str(signatures_path),
-            "metas": str(metas_path),
-            "failures": str(failures_path) if failures else None,
-        },
-    }
-    summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
-    logger.debug(
-        "s2.1_signature.summary",
-        parts=len(sig_rows),
-        failed=len(failures),
-        signatures=str(signatures_path),
-        metas=str(metas_path),
-    )
-    return summary
-
-
-def iter_items(paths: Iterable[Path], raw_root: Path, items_map: Dict[str, Dict[str, Any]], logger: StructuredLogger) -> Iterable[Dict[str, Any]]:
-    for idx, path in enumerate(paths, 1):
-        rel = safe_rel(raw_root, path)
-        dataset = rel.split(os.sep)[0] if os.sep in rel else "unknown"
-        try:
-            size = float(os.path.getsize(path))
-        except Exception:
-            size = 0.0
-        weight = max(1.0, size / (1024.0 * 1024.0))
-        metadata = {
-            "abs_path": str(path),
-            "source_dataset": dataset,
-            "file_ext": os.path.splitext(path)[1].lower(),
-            "rel_path": rel,
-        }
-        items_map[rel] = metadata
-        if idx % 100 == 0:
-            logger.debug("s2.1_signature.scan_progress", processed=idx)
-        yield {
-            "payload_ref": rel,
-            "weight": weight,
-            "metadata": metadata,
-        }
-
+# ---------------------------
+# 任务处理函数
+# ---------------------------
 
 def signature_task_handler(leased: LeasedTask, context: Dict[str, Any]) -> TaskResult:
     logger = StructuredLogger.get_logger("app.s2.1_signature.worker")
@@ -857,7 +702,7 @@ def signature_task_handler(leased: LeasedTask, context: Dict[str, Any]) -> TaskR
     for ref in leased.task.payload_ref:
         meta_hint = items_map.get(ref, {})
         abs_path = meta_hint.get("abs_path", ref)
-        sig, err, meta = compute_signature_for_file(raw_root, Path(abs_path), sample_points, logger, device=device)
+        sig, err, meta = compute_signature_for_file(raw_root, Path(abs_path), sample_points, logger, device=device)  # noqa: F821
         if meta_hint:
             meta = {**meta_hint, **meta}
         row = build_row(sig, meta, err)
@@ -882,173 +727,163 @@ def signature_task_handler(leased: LeasedTask, context: Dict[str, Any]) -> TaskR
         is_final_output=False,
     )
 
+# ---------------------------
+# 聚合
+# ---------------------------
 
-class SignatureExtractionRunner:
-    """S2.1 签名提取主控程序。"""
+def aggregate_outputs(output_root: Path, logger: StructuredLogger) -> Dict[str, Any]:
+    cache_dir = output_root / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    frames: List[pd.DataFrame] = []
+    for csv_path in sorted(cache_dir.glob("*.csv")):
+        try:
+            if csv_path.stat().st_size == 0:
+                continue
+        except FileNotFoundError:
+            continue
+        try:
+            df = pd.read_csv(csv_path)
+            if not df.empty:
+                frames.append(df)
+        except Exception as exc:
+            logger.warning("s2.1_signature.load_cache_failed", file=str(csv_path), error=str(exc))
+    if not frames:
+        out = {"rows": 0, "fingerprint": None, "output": None}
+        logger.info("s2.1_signature.aggregate.empty")
+        return out
+    full = pd.concat(frames, ignore_index=True)
+    out_dir = output_root
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    out_path = out_dir / f"s2.1_signature_{ts}.csv"
+    full.to_csv(out_path, index=False)
+    fp = hashlib.sha256(";".join(sorted(full["part_id"].astype(str))).encode("utf-8")).hexdigest()
+    logger.info("s2.1_signature.aggregate.done", rows=int(full.shape[0]), output=str(out_path), fingerprint=fp)
+    return {"rows": int(full.shape[0]), "fingerprint": fp, "output": str(out_path)}
 
-    def __init__(self, config_path: Optional[Path] = None) -> None:
-        self._config_path = Path(config_path).expanduser().resolve() if config_path else None
+# ---------------------------
+# 基于 TaskFramework 的作业
+# ---------------------------
 
-    def _ensure_config(self) -> Config:
-        log_dir = Path(__file__).resolve().parents[2] / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        Config.set_singleton(None)
-        if self._config_path is not None:
-            os.environ["CAD_TASK_CONFIG"] = str(self._config_path)
-        else:
-            default_cfg = Path(__file__).resolve().parents[2] / "main.yaml"
-            os.environ.setdefault("CAD_TASK_CONFIG", str(default_cfg))
-        cfg = Config.load_singleton(os.environ["CAD_TASK_CONFIG"])
-        StructuredLogger.configure_from_config(cfg)
-        return cfg
+class S21SignatureJob(TaskFramework):
+    def __init__(self) -> None:
+        super().__init__()
+        self._logger = StructuredLogger.get_logger("app.s2.1_signature")
+        self._sig_cfg: Optional[SignatureConfig] = None
+        self._raw_root: Optional[Path] = None
+        self._items_map: Dict[str, Dict[str, Any]] = {}
+        self._item_iter = None
+        self._progress: Optional[ProgressController] = None
+        self._collected: List[Dict[str, Any]] = []
+        self.set_job_id("s2.1-signature")
 
-    def run(self) -> Dict[str, Any]:
-        cfg = self._ensure_config()
+    # 1) 构建 handler 上下文（在启动执行器之前调用）
+    def build_handler_context(self, cfg: Config) -> Dict[str, Any]:
+        prefer_fork_context()  # 兼容容器/WSL
         s2_block = cfg.get("s2", dict, default={})
         section = s2_block.get("s2.1_signature")
         if section is None:
             raise RuntimeError("缺少 s2.1_signature 配置段")
-        sig_cfg = SignatureConfig.from_config(section)
+        self._sig_cfg = SignatureConfig.from_config(section)
+        self._sig_cfg.out_root.mkdir(parents=True, exist_ok=True)
+        raw_root = self._sig_cfg.raw_root
 
-        logger = StructuredLogger.get_logger("app.s2.1_signature")
-        logger.debug(
-            "s2.1_signature.start",
-            raw_root=str(sig_cfg.raw_root),
-            out_root=str(sig_cfg.out_root),
-            device=sig_cfg.device,
-            sample_points=sig_cfg.sample_points,
-        )
-        sig_cfg.out_root.mkdir(parents=True, exist_ok=True)
-
-        raw_root = sig_cfg.raw_root
-        if sig_cfg.demo_occ:
+        # demo OCC
+        if self._sig_cfg.demo_occ:
             from OCC.Core.BRepPrimAPI import BRepPrimAPI_MakeBox, BRepPrimAPI_MakeCylinder
-
-            demo_root = sig_cfg.out_root / "demo_occ"
+            demo_root = self._sig_cfg.out_root / "demo_occ"
             demo_root.mkdir(parents=True, exist_ok=True)
-
             def _write_step(shape, path: Path) -> bool:
                 writer = STEPControl_Writer()
                 writer.Transfer(shape, STEPControl_AsIs)
                 return writer.Write(str(path)) == IFSelect_RetDone
-
-            ok = []
-            ok.append(_write_step(BRepPrimAPI_MakeBox(10, 10, 10).Solid(), demo_root / "DATASETA_box.step"))
-            ok.append(_write_step(BRepPrimAPI_MakeBox(10, 10, 10).Solid(), demo_root / "DATASETA_box_dup.step"))
-            ok.append(_write_step(BRepPrimAPI_MakeBox(13, 13, 13).Solid(), demo_root / "DATASETB_box_scaled.step"))
-            ok.append(_write_step(BRepPrimAPI_MakeCylinder(4.0, 12.0).Solid(), demo_root / "DATASETB_cylinder.step"))
-            logger.debug("s2.1_signature.demo_generated", ok=sum(ok), total=4, path=str(demo_root))
+            _ = [
+                _write_step(BRepPrimAPI_MakeBox(10, 10, 10).Solid(), demo_root / "DATASETA_box.step"),
+                _write_step(BRepPrimAPI_MakeBox(10, 10, 10).Solid(), demo_root / "DATASETA_box_dup.step"),
+                _write_step(BRepPrimAPI_MakeBox(13, 13, 13).Solid(), demo_root / "DATASETB_box_scaled.step"),
+                _write_step(BRepPrimAPI_MakeCylinder(4.0, 12.0).Solid(), demo_root / "DATASETB_cylinder.step"),
+            ]
             raw_root = demo_root
 
-        limit, path_iter = discover_parts(raw_root, sig_cfg.subset_n, sig_cfg.subset_frac, logger)
+        # 预扫描，供 handler 与分片共用
+        limit, path_iter = discover_parts(raw_root, self._sig_cfg.subset_n, self._sig_cfg.subset_frac, self._logger)
         if limit == 0:
-            logger.warning("s2.1_signature.no_files", raw_root=str(raw_root))
-            return aggregate_outputs(sig_cfg.out_root, logger)
+            self._logger.warning("s2.1_signature.no_files", raw_root=str(raw_root))
+        self._items_map = {}
+        self._item_iter = iter_items(path_iter, raw_root, self._items_map, self._logger)
+        self._raw_root = raw_root
 
-        queue_path = cfg.get("task_system.pool.backend.path", str, default=None)
-        if queue_path:
-            qdir = Path(queue_path).expanduser().resolve()
-            if qdir.exists():
-                shutil.rmtree(qdir)
-        items_map: Dict[str, Dict[str, Any]] = {}
-        item_iter = iter_items(path_iter, raw_root, items_map, logger)
+        # 进度（流式）
+        self._progress = ProgressController(total_units=None, description="S2.1 签名提取", unit_name="file")
+        self._progress.start()
+
+        # handler 上下文
+        return {
+            "raw_root": raw_root,
+            "sample_points": self._sig_cfg.sample_points,
+            "device": self._sig_cfg.device,
+            "items_map": self._items_map,
+            "output_root": str(self._sig_cfg.out_root),
+            "progress": self._progress.make_proxy(),
+        }
+
+    # 2) 产出任务
+    def produce_tasks(self) -> Iterable[TaskRecord]:
+        assert self._sig_cfg is not None and self._item_iter is not None
         constraints = PartitionConstraints(
-            max_items_per_task=sig_cfg.partition.max_items_per_task,
-            max_weight_per_task=sig_cfg.partition.max_weight_per_task,
-            shuffle_seed=sig_cfg.partition.shuffle_seed,
+            max_items_per_task=self._sig_cfg.partition.max_items_per_task,
+            max_weight_per_task=self._sig_cfg.partition.max_weight_per_task,
+            shuffle_seed=self._sig_cfg.partition.shuffle_seed,
         )
-        pool = TaskPool()
-        weights: List[float] = []
-        task_count = 0
-        for task in TaskPartitioner.iter_tasks({"job_id": "s2.1-signature"}, item_iter, sig_cfg.partition.strategy, constraints=constraints):
-            pool.put(task)
-            weights.append(task.weight)
-            task_count += 1
-        total_files = len(items_map)
-        logger.debug(
-            "s2.1_signature.plan_ready",
-            task_count=task_count,
-            total_weight=sum(weights),
+        count = 0
+        total_w = 0.0
+        for task in TaskPartitioner.iter_tasks(
+            {"job_id": self.job_id},
+            self._item_iter,
+            self._sig_cfg.partition.strategy,
+            constraints=constraints,
+        ):
+            count += 1
+            total_w += task.weight
+            if self._progress is not None:
+                self._progress.discovered(len(task.payload_ref))
+            yield task
+        self._logger.debug("s2.1_signature.plan_ready", task_count=count, total_weight=total_w)
+
+    # 3) 处理单个任务
+    def handle(self, leased: LeasedTask, context: Dict[str, Any]) -> TaskResult:
+        return signature_task_handler(leased, context)
+
+    # 4) 处理结果回调（主进程）
+    def result_handler(self, _leased: LeasedTask, result: TaskResult) -> None:
+        self._collected.append(result.metadata)
+        self._logger.debug(
+            "s2.1_signature.task_complete",
+            task_id=result.metadata.get("task_id"),
+            processed=result.metadata.get("processed"),
+            failures=len(result.metadata.get("failures") or []),
         )
-        logger.debug("s2.1_signature.pool_stats", stats=dict(pool.stats()))
 
-        policy = ExecutorPolicy()
-        collected_metadata: List[Dict[str, Any]] = []
+    # 5) 收尾
+    def after_run(self, cfg: Config) -> None:
+        if self._progress is not None:
+            with contextlib.suppress(Exception):
+                self._progress.close()
+        if self._sig_cfg is not None:
+            aggregate_outputs(self._sig_cfg.out_root, self._logger)
 
-        def on_result(_leased: LeasedTask, result: TaskResult) -> None:
-            collected_metadata.append(result.metadata)
-            logger.debug(
-                "s2.1_signature.task_complete",
-                task_id=result.metadata.get("task_id"),
-                processed=result.metadata.get("processed"),
-                failures=len(result.metadata.get("failures") or []),
-                cache_path=result.written_path,
-            )
+# ---------------------------
+# CLI
+# ---------------------------
 
-        prefer_fork_context()
-        with ProgressController(total_units=max(1, total_files), description="S2.1 签名提取") as progress:
-            context = {
-                "raw_root": raw_root,
-                "sample_points": sig_cfg.sample_points,
-                "device": sig_cfg.device,
-                "items_map": items_map,
-                "output_root": str(sig_cfg.out_root),
-                "progress": progress.make_proxy(),
-            }
-            try:
-                ParallelExecutor.run(
-                    handler=signature_task_handler,
-                    pool=pool,
-                    policy=policy,
-                    handler_context=context,
-                    result_handler=on_result,
-                    console_min_level="INFO",
-                )
-            except PermissionError as exc:
-                logger.warning("s2.1_signature.parallel_unavailable", error=str(exc))
-                run_sequential_executor(pool, signature_task_handler, context, on_result, policy, logger)
-            except OSError as exc:
-                logger.warning("s2.1_signature.parallel_oserror", error=str(exc))
-                run_sequential_executor(pool, signature_task_handler, context, on_result, policy, logger)
-
-        summary = aggregate_outputs(sig_cfg.out_root, logger)
-        logger.debug("s2.1_signature.done", summary=summary, tasks=len(collected_metadata))
-        return summary
-
-
-def _normalize_datetime(value: str) -> Optional[str]:
-    text = (value or "").strip()
-    if not text:
-        return None
-    for candidate in (text, text.replace(" ", "T")):
-        with contextlib.suppress(ValueError):
-            dt = datetime.fromisoformat(candidate)
-            if dt.tzinfo is None:
-                return dt.replace(tzinfo=timezone.utc).isoformat()
-            return dt.astimezone(timezone.utc).isoformat()
-    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y%m%dT%H%M%S", "%Y-%m-%d %H:%M:%S"):
-        with contextlib.suppress(ValueError):
-            return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc).isoformat()
-    return None
-
-
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="运行 S2.1 签名提取流水线")
-    parser.add_argument(
-        "-config",
-        "--config",
-        dest="config",
-        default=None,
-        help="配置文件路径（默认读取 main.yaml）",
-    )
-    return parser.parse_args()
-
-
-def main() -> None:
-    args = _parse_args()
-    runner = SignatureExtractionRunner(config_path=args.config)
-    runner.run()
-
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default=None, help="main.yaml 路径")
+    args = parser.parse_args()
+    if args.config:
+        os.environ["CAD_TASK_CONFIG"] = str(Path(args.config).expanduser().resolve())
+    job = S21SignatureJob()
+    return job.run()
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

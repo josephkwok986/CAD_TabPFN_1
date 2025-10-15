@@ -107,6 +107,8 @@ def main():
     ap.add_argument("--root", default=".", help="根目录，默认当前目录。")
     args = ap.parse_args()
 
+    rm("./logs", True, dry_run=False)
+    rm("./task_queue", True, dry_run=False)
     rm("./test/demo_runtime", True, dry_run=False)
     rm("./test/runtime", True, dry_run=False)
     rm("./test/output", True, dry_run=False)

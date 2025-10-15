@@ -42,6 +42,7 @@ class TaskFramework(ABC):
         self._executor: Optional[ParallelExecutor] = None
         self._stop_flag = threading.Event()
         self._logger = StructuredLogger.get_logger("cad.main_framework")
+        self._job_id: str = "job"
 
     # ------------------------- 需子类实现 -------------------------
 
@@ -64,6 +65,13 @@ class TaskFramework(ABC):
     def build_handler_context(self, cfg: Config) -> Any:
         """构建传入 worker 的只读上下文。默认 None。"""
         return None
+
+    @property
+    def job_id(self) -> str:
+        return self._job_id
+
+    def set_job_id(self, job_id: str) -> None:
+        self._job_id = str(job_id)
 
     def before_run(self, cfg: Config) -> None:
         """任务开始前的准备钩子。默认无动作。"""
