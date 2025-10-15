@@ -1,2 +1,20 @@
 docker build -t tabpfn_cad -f Dockerfile.tabfpn_cad1.0 .
-docker run -it -v "/mnt/c/Users/GJJ/":/workspace -v "/mnt/c/Users/GJJ/Gjj Doc/Code/git/.ssh:/root/.ssh:ro" -p 8888:8888 --rm --gpus all tabpfn_cad /bin/bash -c "cd /workspace/'Gjj Doc'/Code && /bin/bash /start_jupyter.sh && exec /bin/bash"
+
+docker run -it -v "/mnt/c/Users/GJJ/":/workspace -v "/mnt/c/Users/GJJ/Gjj Doc/Code/certification/git/.ssh:/root/.ssh:ro" -v "/mnt/c/Users/GJJ/Gjj Doc/Code/certification/.codex:/root/.codex:rw" -p 8888:8888 -p 1455:1455 --rm --gpus all --name tc tabpfn_cad /bin/bash -c "cd /workspace/'Gjj Doc'/Code && /bin/bash /start_jupyter.sh && exec /bin/bash"
+
+docker exec -it tc bash -c "cd /workspace/'Gjj Doc'/Code && exec /bin/bash"
+
+
+
+
+
+
+
+python app/s2/s2.1_signature_pipeline.py --config main.yaml
+pkill -9 -f "python app/s2/s2.1_signature_pipeline.py --config main.yaml"
+ps -ef | grep -v grep | grep "python -m app.s2.pipeline"
+
+clean.py --dry-run
+python3 clean.py -y
+
+codex "$(cat prompt.txt)"

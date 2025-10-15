@@ -1,73 +1,124 @@
+# 顶层配置版本号
 version: 1
+# 配置元信息
 config:
+  # 配置架构版本
   version: 1
-app:
-  name: ${APP_NAME:my-service}
-  env: ${APP_ENV:dev}
-  tz_store: UTC
-  tz_render: ${LOG_RENDER_TZ:Europe/London}
-runtime:
-  tz: UTC
-io:
-  root: /var/run/app
-  retry: 3
-limits:
-  rate: 100
-  concurrency: 16
-db:
-  host: 127.0.0.1
-  port: 5432
-secrets:
-  db_password: env:DB_PASS
+# 日志系统配置
 logger:
-  level: ${LOG_LEVEL:INFO}
-  namespace: ${LOG_NAMESPACE:cad.tabpfn}
-  timezone:
-    render: ${LOG_RENDER_TZ:Europe/London}
+  # 默认日志级别
+  level: INFO
+  # 日志命名空间
+  namespace: cad.pipeline
+  # 输出目标列表
   sinks:
-    - type: console
+    - # 控制台输出通道
+      type: console
+      # 流类型
       stream: stdout
-    - type: rotating_file
-      path: ${LOG_FILE_PATH:logs/app.log}
-      max_bytes: ${LOG_FILE_MAX_BYTES:10485760}
-      backups: ${LOG_FILE_BACKUPS:5}
-  sampling:
-    default_rate: ${LOG_SAMPLING_DEFAULT:1.0}
-    seed: ${LOG_SAMPLING_SEED:42}
-    rules:
-      - level: DEBUG
-        rate: ${LOG_SAMPLING_DEBUG_RATE:0.1}
-        burst: 5
-        interval: 60
-  redact:
-    allow:
-      - trace_id
-      - span_id
-      - corr_id
-    deny_patterns:
-      - password
-      - secret
-      - token
-      - key
-      - credential
-      - pwd
+      # 最低输出级别
+      min_level: ERROR
+    - # 文件输出通道
+      type: rotating_file
+      # 日志文件路径
+      path: "/workspace/Gjj Doc/Code/CAD_TabPFN_1/logs/pipeline.log"
+      # 单文件最大尺寸（字节）
+      max_bytes: 10485760
+      # 轮转备份数量
+      backups: 5
+# 任务系统参数
 task_system:
+  # 任务池设置
   pool:
-    default_ttl: 120.0
+    # 默认租约持续时间（秒）
+    default_ttl: 30.0
+    # 任务池后端
     backend:
+      # 后端类型
       type: memory
+  # 执行器策略
   executor:
-    max_concurrency: 4
-    lease_batch_size: 10
+    # 最大并发 worker 数
+    max_concurrency: 32
+    # 每次租借任务数
+    lease_batch_size: 64
+    # 租约时长（秒）
     lease_ttl: 30.0
-    prefetch: 20
-    idle_sleep: 0.5
-    max_retries: 2
-    backoff_base: 0.5
-    backoff_jitter: 0.3
+    # 预取队列长度
+    prefetch: 128
+    # 空闲等待时间（秒）
+    idle_sleep: 0.1
+    # 最大重试次数
+    max_retries: 1
+    # 退避基准秒数
+    backoff_base: 0.2
+    # 退避抖动幅度
+    backoff_jitter: 0.1
+    # 任务超时阈值（秒，null 表示不限）
     task_timeout: null
-    rate_limit_per_sec: null
-    rate_limit_burst: null
+    # 失败后延时重试（秒，null 表示默认）
     failure_delay: null
+    # 任务过滤器
     filters: {}
+    # 失败任务是否重新入队
     requeue_on_failure: true
+    # 指定优先 GPU 列表
+    preferred_gpus: []
+    # 心跳间隔（秒，null 表示自动）
+    heartbeat_interval: null
+# 任务切分默认配置
+task_partitioner:
+  # 默认约束参数
+  defaults:
+    # 每个任务最大条目数
+    max_items_per_task: 128
+    # 切分洗牌种子
+    shuffle_seed: 42
+# S2 阶段配置
+s2:
+  # S2.1 几何签名提取
+  's2.1_signature':
+    # 原始 CAD 数据根目录
+    raw_root: "/workspace/Gjj Local/data/CAD/CAD_data"
+    # S2 输出根目录
+    out_root: "/workspace/Gjj Local/data/CAD/step_out/s2_out"
+    # 每个零件采样点数量
+    sample_points: 4096
+    # 固定样本数量（null 表示不限）
+    subset_n: null
+    # 样本抽样比例（null 表示不限）
+    subset_frac: null
+    # D2 描述子计算设备偏好
+    device: auto
+    # 是否生成 OCC 演示数据
+    demo_occ: false
+    # 任务切分策略
+    partition:
+      # 切分策略名称
+      strategy: weighted
+      # 分组字段
+      group_by: null
+      # 单任务最大条目数
+      max_items_per_task: 128
+      # 任务数量上限（null 表示自动）
+      max_tasks: null
+      # 切分洗牌种子
+      shuffle_seed: 42
+  # S2.2 去重聚类
+  's2.2_dedup':
+    # S2 输出根目录（复用 S2.1 输出）
+    out_root: "/workspace/Gjj Local/data/CAD/step_out/s2_out"
+    # FAISS 计算设备偏好
+    device: gpu
+    # D2 相似度阈值
+    d2_sim_threshold: 0.995
+    # 包围盒容差阈值
+    bbox_tol: 0.02
+    # 特征归一化策略
+    feature_norm:
+      # 是否对每个块做 L2 归一化
+      block_l2: true
+      # 是否对拼接后的向量再做 L2 归一化
+      global_l2: true
+      # 块权重模式
+      block_weight: equal

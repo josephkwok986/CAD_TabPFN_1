@@ -1,0 +1,36 @@
+# Example configuration for running the demo program under test/.
+version: 1
+config:
+  version: 1
+logger:
+  level: INFO
+  namespace: demo.cad
+  sinks:
+    - type: rotating_file
+      path: test/app.log
+      max_bytes: 2097152
+      backups: 2
+task_system:
+  pool:
+    default_ttl: 30.0
+    backend:
+      type: file
+      path: test/runtime/queue
+      flush_each_put: true
+      max_attempts: 3
+      retry_delay_seconds: 0.5
+  executor:
+    max_concurrency: 2
+    lease_batch_size: 2
+    lease_ttl: 5.0
+    prefetch: 4
+    idle_sleep: 0.1
+    max_retries: 1
+    backoff_base: 0.2
+    backoff_jitter: 0.1
+    task_timeout: null
+    failure_delay: null
+    filters: {}
+    requeue_on_failure: true
+    preferred_gpus: []
+    heartbeat_interval: null

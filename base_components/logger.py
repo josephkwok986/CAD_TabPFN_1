@@ -34,6 +34,7 @@ import io
 import json
 import logging
 import logging.handlers
+import os
 import random
 import sys
 import threading
@@ -41,7 +42,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, MutableMapping, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, MutableMapping, Optional, Tuple
 
 try:  # Prefer ultra fast JSON serialiser when available.
     import orjson as _orjson  # type: ignore
@@ -73,7 +74,7 @@ except Exception:
     tz = _FallbackTZ()  # type: ignore
 
 try:
-    from config import Config  # type: ignore
+    from .config import Config  # type: ignore
     _CONFIG_IMPORT_ERROR: Optional[Exception] = None
 except Exception as exc:  # pragma: no cover
     Config = None  # type: ignore
@@ -94,13 +95,11 @@ _STANDARD_FIELDS = {
     "span_id",
     "corr_id",
     "job_id",
-    "task_id",
     "attempt",
     "latency_ms",
     "msg",
     "event",
     "ts",
-    "ts_local",
     "logger",
     "file",
     "level",
@@ -116,18 +115,9 @@ _SECRET_PATTERNS = (
     "pwd",
 )
 
-
 def _utcnow() -> _dt.datetime:
     return _dt.datetime.now(tz.tzutc())
-
-
-def _isoformat(dt: _dt.datetime) -> str:
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=tz.tzutc())
-    return dt.astimezone(tz.tzutc()).isoformat().replace("+00:00", "Z")
-
-
-def _safe_summary(value: Any, *, max_length: int = 512) -> Any:
+def _safe_summary(value: Any, *, max_length: int = 16384) -> Any:
     """Return a representation safe for JSON serialisation."""
     if value is None or isinstance(value, (bool, int, float)):
         return value
@@ -260,13 +250,25 @@ class Sink:
 
 
 class ConsoleSink(Sink):
-    def __init__(self, stream: str = "stdout") -> None:
+    def __init__(self, stream: str = "stdout", min_level: Optional[str] = None) -> None:
         if stream not in {"stdout", "stderr"}:
             raise ValueError("stream must be 'stdout' or 'stderr'")
         self._stream = sys.stdout if stream == "stdout" else sys.stderr
         self._lock = threading.Lock()
+        if min_level is not None:
+            level_value = _LEVEL_MAP.get(min_level.upper())
+            if level_value is None:
+                raise ValueError(f"Unknown min_level for ConsoleSink: {min_level}")
+            self._min_level = level_value
+        else:
+            self._min_level = None
 
     def emit(self, record: Dict[str, Any], serialized: str) -> None:
+        if self._min_level is not None:
+            level_name = str(record.get("level", "INFO")).upper()
+            level_value = _LEVEL_MAP.get(level_name, 0)
+            if level_value < self._min_level:
+                return
         with self._lock:
             self._stream.write(serialized + "\n")
             self._stream.flush()
@@ -274,8 +276,25 @@ class ConsoleSink(Sink):
 
 class RotatingFileSink(Sink):
     def __init__(self, path: str, max_bytes: int = 10 * 1024 * 1024, backups: int = 5) -> None:
-        self._path = Path(path)
-        self._path.parent.mkdir(parents=True, exist_ok=True)
+        realpath = os.path.realpath(path)
+        self._path = Path(realpath)
+        parent = self._path.parent
+        parent.mkdir(parents=True, exist_ok=True)
+        if not self._path.exists():
+            retries = 0
+            while retries < 8:
+                try:
+                    fd = os.open(realpath, os.O_APPEND | os.O_CREAT, 0o644)
+                    os.close(fd)
+                    break
+                except FileNotFoundError:
+                    time.sleep(0.2)
+                    retries += 1
+            else:
+                parent_listing = list(parent.parent.glob("*"))
+                raise FileNotFoundError(
+                    f"无法创建日志文件: {self._path}；上层目录内容: {parent_listing}"
+                )
         self._handler = logging.handlers.RotatingFileHandler(
             filename=str(self._path),
             maxBytes=int(max_bytes),
@@ -548,31 +567,33 @@ class StructuredLogger:
 
     def _make_record(self, level: str, event: str, fields: Dict[str, Any]) -> Dict[str, Any]:
         now = _utcnow()
+        offset = tz.gettz("Asia/Shanghai")
+        if offset is None:
+            offset = _dt.timezone(_dt.timedelta(hours=8))
+        ts_value = now.astimezone(offset).isoformat()
         frame_info = self._caller_frame()
         context = self._context.get()
         combined: Dict[str, Any] = {**context, **fields}
         redacted = _MANAGER.redactor.redact_mapping(dict(combined))
         record: Dict[str, Any] = {
-            "ts": _isoformat(now),
-            "ts_local": now.astimezone(_MANAGER.render_tz).isoformat(),
+            "ts": ts_value,
             "level": level,
             "event": event,
-            "logger": self.name,
             "file": f"{frame_info.filename}:{frame_info.lineno}",
         }
-        # Extract known keys
         for key in [
             "trace_id",
             "span_id",
             "corr_id",
             "job_id",
-            "task_id",
             "attempt",
             "latency_ms",
             "msg",
         ]:
             if key in redacted:
                 record[key] = redacted.pop(key)
+        redacted.pop("task_id", None)
+        redacted.pop("stage", None)
         extras = {k: v for k, v in redacted.items() if k not in _STANDARD_FIELDS}
         record["extras"] = extras or None
         return record
@@ -590,9 +611,36 @@ class StructuredLogger:
 
     @staticmethod
     def _serialize(record: Dict[str, Any]) -> str:
-        if _orjson is not None:
-            return _orjson.dumps(record).decode("utf-8")
-        return json.dumps(record, separators=(",", ":"), ensure_ascii=False)
+        def _stringify(value: Any) -> str:
+            if isinstance(value, (dict, list, tuple)):
+                return json.dumps(value, ensure_ascii=False)
+            return str(value)
+
+        segments: List[str] = []
+
+        def append(field: Optional[str], val: Any) -> None:
+            if val is None or val == "":
+                return
+            rendered = _stringify(val)
+            if field is None:
+                segments.append(rendered)
+            else:
+                segments.append(f"{field}={rendered}")
+
+        append(None, record.get("ts"))
+        append(None, record.get("file"))
+        append(None, record.get("level"))
+        append("event", record.get("event"))
+        for key in ["trace_id", "span_id", "corr_id", "job_id", "attempt", "latency_ms", "msg"]:
+            if key in record:
+                append(key, record.get(key))
+
+        extras = record.get("extras") or {}
+        if isinstance(extras, dict):
+            for key, value in extras.items():
+                append(key, value)
+
+        return "|".join(segments)
 
     # Utilities -----------------------------------------------------
     @staticmethod
@@ -601,13 +649,21 @@ class StructuredLogger:
             return spec
         typ = spec.get("type")
         if typ == "console":
-            return ConsoleSink(stream=spec.get("stream", "stdout"))
-        if typ in {"file", "rotating_file"}:
-            return RotatingFileSink(
-                path=spec["path"],
-                max_bytes=int(spec.get("max_bytes", 10 * 1024 * 1024)),
-                backups=int(spec.get("backups", 5)),
+            return ConsoleSink(
+                stream=spec.get("stream", "stdout"),
+                min_level=spec.get("min_level"),
             )
+        if typ in {"file", "rotating_file"}:
+            try:
+                return RotatingFileSink(
+                    path=spec["path"],
+                    max_bytes=int(spec.get("max_bytes", 10 * 1024 * 1024)),
+                    backups=int(spec.get("backups", 5)),
+                )
+            except FileNotFoundError as exc:
+                raise RuntimeError(
+                    f"无法创建日志文件 {spec.get('path')}: {exc}"
+                ) from exc
         if typ == "syslog":
             return SyslogSink(
                 address=spec.get("address"),

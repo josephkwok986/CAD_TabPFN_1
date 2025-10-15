@@ -1,0 +1,8 @@
+'EOF'
+
+在所有回答和注释等内容，都尽量使用中文。
+
+
+【 task_queue 是file_queue.py产生的队列吗？如果是，把 task_queue 产生的目录由config.py这个单例配置来指定目录生成】
+
+EOF
