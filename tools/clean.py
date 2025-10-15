@@ -107,6 +107,11 @@ def main():
     ap.add_argument("--root", default=".", help="根目录，默认当前目录。")
     args = ap.parse_args()
 
+    rm("./test/demo_runtime", True, dry_run=False)
+    rm("./test/runtime", True, dry_run=False)
+    rm("./test/output", True, dry_run=False)
+    rm("./test/app.log", False, dry_run=False)
+
     root = os.path.abspath(args.root)
     targets = list(iter_targets(root))
 
@@ -133,9 +138,6 @@ def main():
         rm(p, is_dir, dry_run=False)
         removed += 1
     print(f"removed {removed} items")
-
-    
-    rm("./test/output", True, dry_run=False)
 
 if __name__ == "__main__":
     main()

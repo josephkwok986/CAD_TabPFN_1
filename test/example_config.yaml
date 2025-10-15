@@ -6,15 +6,17 @@ logger:
   level: INFO
   namespace: demo.cad
   sinks:
-    - type: console
-      stream: stdout
-      min_level: INFO
+    - type: rotating_file
+      path: test/app.log
+      max_bytes: 2097152
+      backups: 2
 task_system:
   pool:
     default_ttl: 30.0
     backend:
       type: file
-      path: output/queue
+      path: test/runtime/queue
+      flush_each_put: true
       max_attempts: 3
       retry_delay_seconds: 0.5
   executor:

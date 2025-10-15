@@ -468,6 +468,19 @@ class ParallelExecutor:
             active=self._active_tasks,
         )
 
+    def _should_stop_dispatch(self, stats: Mapping[str, Union[int, float]]) -> bool:
+        if not self._pool.is_sealed():
+            return False
+        if self._active_tasks > 0:
+            return False
+        visible = int(stats.get("visible", 0))
+        leased = int(stats.get("leased", 0))
+        if visible > 0 or leased > 0:
+            return False
+        total = int(stats.get("total", 0))
+        acked = int(stats.get("acked", -1))
+        return acked >= total
+
     def _stop_workers(self) -> None:
         for _ in self._workers:
             try:
@@ -515,7 +528,7 @@ class ParallelExecutor:
                 if not leased:
                     stats = self._pool.stats()
                     self._log_dispatch_idle("no_visible_tasks", stats)
-                    if stats.get("visible", 0) == 0 and self._active_tasks == 0:
+                    if self._should_stop_dispatch(stats):
                         break
                     time.sleep(self._idle_sleep)
                     continue
@@ -545,6 +558,7 @@ class ParallelExecutor:
             try:
                 message = self._result_queue.get(timeout=0.5)
             except queue.Empty:
+                # 当分发线程结束且无活跃任务时收尾
                 if self._dispatch_done.is_set() and self._active_tasks == 0:
                     break
                 continue
@@ -571,16 +585,16 @@ class ParallelExecutor:
                 _, leased, error_text, tb, latency = message
                 exc_obj = RuntimeError(str(error_text))
                 self._events.on_dead(self, leased, exc_obj)
-                requeue = self._policy.requeue_on_failure
-                if not self._pool.nack(
-                    leased.task.task_id,
-                    requeue=requeue,
-                    delay=self._policy.failure_delay,
-                ):
-                    logger.error("executor.nack_failed", task_id=leased.task.task_id, error=error_text)
-                if not requeue:
-                    self._pool.mark_dead(leased.task.task_id, str(error_text))
-                    logger.error("executor.task_dead", task_id=leased.task.task_id, error=error_text, traceback=tb)
+                if not self._pool.mark_dead(leased.task.task_id, str(error_text)):
+                    logger.error("executor.mark_dead_failed", task_id=leased.task.task_id, error=error_text)
+                else:
+                    logger.error(
+                        "executor.task_dead",
+                        task_id=leased.task.task_id,
+                        error=error_text,
+                        traceback=tb,
+                        latency=latency,
+                    )
                 self._decrement_active()
             elif msg_type == "hb":
                 _, task_id = message
