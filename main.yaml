@@ -43,7 +43,7 @@ task_system:
     # 每次租借任务数
     lease_batch_size: 64
     # 租约时长（秒）
-    lease_ttl: 30.0
+    lease_ttl: 180.0
     # 预取队列长度
     prefetch: 128
     # 空闲等待时间（秒）
